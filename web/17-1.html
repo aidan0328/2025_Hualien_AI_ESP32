@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <!-- 0-4. 網頁採用UTF-8 編碼 -->
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>實驗 #17-1：可變電阻數值監控</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f2f5;
+            color: #333;
+        }
+        .container {
+            text-align: center;
+            padding: 40px;
+            background-color: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            border: 1px solid #ddd;
+        }
+        h1 {
+            color: #0056b3;
+            margin-bottom: 20px;
+        }
+        .data-display {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #d9534f;
+            margin: 20px 0;
+            padding: 10px 20px;
+            border: 2px solid #eee;
+            border-radius: 8px;
+            background-color: #f9f9f9;
+            min-width: 150px;
+            display: inline-block;
+        }
+        .status {
+            margin-top: 20px;
+            font-size: 0.9em;
+            color: #666;
+        }
+        .status-light {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+        .connected { background-color: #5cb85c; }
+        .disconnected { background-color: #d9534f; }
+        .connecting { background-color: #f0ad4e; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>可變電阻數值監控</h1>
+        <p>1. 網頁上顯示可電電阻的數值。</p>
+        <div class="data-display">
+            <span id="adcValue">---</span>
+        </div>
+        <div class="status">
+            <span id="status-light" class="status-light connecting"></span>
+            <span id="status-text">連線中...</span>
+        </div>
+    </div>
+
+    <!-- 0-8. 使用 websocket 傳輸 -->
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            const adcValueElement = document.getElementById('adcValue');
+            const statusTextElement = document.getElementById('status-text');
+            const statusLightElement = document.getElementById('status-light');
+            
+            // 使用 window.location.host 動態取得主機位址
+            const wsUrl = `ws://${window.location.host}/ws`;
+            let socket;
+
+            function connectWebSocket() {
+                console.log("Attempting to connect to WebSocket at:", wsUrl);
+                socket = new WebSocket(wsUrl);
+
+                socket.onopen = function(event) {
+                    console.log("WebSocket connection opened.");
+                    statusTextElement.textContent = "Websocket 已連線";
+                    statusLightElement.className = 'status-light connected';
+                };
+
+                socket.onmessage = function(event) {
+                    // 接收從 ESP32 傳來的 ADC 數值並更新網頁
+                    adcValueElement.textContent = event.data;
+                };
+
+                socket.onclose = function(event) {
+                    console.log("WebSocket connection closed. Reconnecting in 3 seconds...");
+                    statusTextElement.textContent = "Websocket 已斷線，嘗試重新連線...";
+                    statusLightElement.className = 'status-light disconnected';
+                    setTimeout(connectWebSocket, 3000); // 3秒後嘗試重連
+                };
+
+                socket.onerror = function(error) {
+                    console.error("WebSocket error:", error);
+                    statusTextElement.textContent = "Websocket 連線錯誤";
+                    statusLightElement.className = 'status-light disconnected';
+                    socket.close();
+                };
+            }
+            
+            connectWebSocket();
+        });
+    </script>
+</body>
+</html>

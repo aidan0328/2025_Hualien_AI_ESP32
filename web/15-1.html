@@ -1,0 +1,164 @@
+<!-- /web/15-1.html -->
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 LED 亮度控制</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+            color: #333;
+        }
+        .container {
+            text-align: center;
+            padding: 20px;
+            border-radius: 10px;
+            background-color: white;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        #led-visual {
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            margin: 20px auto;
+            transition: background-color 0.3s, box-shadow 0.3s;
+            border: 2px solid #555;
+            background-color: #757575;
+        }
+        .led-on {
+            background-color: #ffd700; /* 黃色 */
+        }
+        .button-group {
+            margin: 20px 0;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            margin: 5px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+            color: white;
+            transition: background-color 0.2s;
+        }
+        #btn-on { background-color: #4CAF50; } /* 綠色 */
+        #btn-off { background-color: #f44336; } /* 紅色 */
+        #btn-toggle { background-color: #008CBA; } /* 藍色 */
+        .slider-container {
+            width: 80%;
+            margin: 20px auto;
+        }
+        input[type="range"] {
+            width: 100%;
+            cursor: pointer;
+        }
+        #status-text {
+            margin-top: 15px;
+            font-size: 14px;
+            color: #666;
+            min-height: 20px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>ESP32 LED 控制</h1>
+        <div id="led-visual"></div>
+        <div class="button-group">
+            <button id="btn-on">開啟 LED</button>
+            <button id="btn-off">關閉 LED</button>
+            <button id="btn-toggle">切換 LED</button>
+        </div>
+        <div class="slider-container">
+            <label for="brightnessSlider">亮度調整 (5% - 100%)</label>
+            <input type="range" id="brightnessSlider" min="5" max="100" value="100" disabled>
+        </div>
+        <p id="status-text">正在連線...</p>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const ledVisual = document.getElementById('led-visual');
+            const btnOn = document.getElementById('btn-on');
+            const btnOff = document.getElementById('btn-off');
+            const btnToggle = document.getElementById('btn-toggle');
+            const brightnessSlider = document.getElementById('brightnessSlider');
+            const statusText = document.getElementById('status-text');
+            
+            const socket = new WebSocket('ws://' + window.location.host + '/ws');
+
+            function sendCommand(action, value = null) {
+                if (socket.readyState === WebSocket.OPEN) {
+                    const command = { action: action };
+                    if (value !== null) {
+                        command.value = parseInt(value);
+                    }
+                    socket.send(JSON.stringify(command));
+                } else {
+                    console.log('WebSocket 尚未連線');
+                }
+            }
+            
+            function updateUI(state, brightness) {
+                if (state === 'on') {
+                    ledVisual.classList.add('led-on');
+                    brightnessSlider.disabled = false;
+                    const brightnessValue = brightness / 100;
+                    ledVisual.style.backgroundColor = `rgba(255, 215, 0, ${brightnessValue})`;
+                    ledVisual.style.boxShadow = `0 0 20px rgba(255, 215, 0, ${brightnessValue})`;
+                    statusText.textContent = `狀態: 開啟, 亮度: ${brightness}%`;
+                } else {
+                    ledVisual.classList.remove('led-on');
+                    brightnessSlider.disabled = true;
+                    ledVisual.style.backgroundColor = '#757575';
+                    ledVisual.style.boxShadow = 'none';
+                    statusText.textContent = `狀態: 關閉`;
+                }
+                brightnessSlider.value = brightness;
+            }
+
+            socket.onopen = (event) => {
+                statusText.textContent = '連線成功！';
+            };
+
+            socket.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log('收到狀態更新:', data);
+                    updateUI(data.state, data.brightness);
+                } catch (e) {
+                    console.error('解析 JSON 失敗:', e);
+                }
+            };
+
+            socket.onclose = (event) => {
+                statusText.textContent = '連線已中斷。請重新整理頁面。';
+                statusText.style.color = 'red';
+                brightnessSlider.disabled = true;
+            };
+
+            socket.onerror = (error) => {
+                statusText.textContent = '連線錯誤！';
+                statusText.style.color = 'red';
+            };
+
+            btnOn.addEventListener('click', () => sendCommand('on'));
+            btnOff.addEventListener('click', () => sendCommand('off'));
+            btnToggle.addEventListener('click', () => sendCommand('toggle'));
+            brightnessSlider.addEventListener('input', () => {
+                sendCommand('set_brightness', brightnessSlider.value);
+            });
+        });
+    </script>
+
+</body>
+</html>

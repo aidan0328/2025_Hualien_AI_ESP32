@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 LED 即時控制 (WebSocket)</title>
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #1a1a2e;
+            color: #e0e0e0;
+        }
+        .container {
+            text-align: center;
+            padding: 40px;
+            background-color: #16213e;
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            border: 1px solid #0f3460;
+        }
+        h1 { 
+            color: #e94560; 
+        }
+        #toggleBtn {
+            padding: 20px 40px;
+            font-size: 24px;
+            font-weight: bold;
+            cursor: pointer;
+            border: none;
+            border-radius: 10px;
+            background-color: #1f4068;
+            color: #e0e0e0;
+            transition: background-color 0.3s, transform 0.1s;
+            box-shadow: 0 5px #0f3460;
+        }
+        #toggleBtn:active {
+            transform: translateY(3px);
+            box-shadow: 0 2px #0f3460;
+        }
+        #status {
+            margin-top: 20px;
+            font-size: 18px;
+            color: #9a9a9a;
+            height: 25px; /* 預留空間避免跳動 */
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ESP32 LED 即時控制</h1>
+        <p>透過 WebSocket 協議即時切換 LED 狀態。</p>
+        <button id="toggleBtn">切換 LED</button>
+        <div id="status">正在連線到伺服器...</div>
+    </div>
+
+    <script>
+        // 獲取頁面元素
+        const toggleButton = document.getElementById('toggleBtn');
+        const statusDiv = document.getElementById('status');
+
+        // 建立 WebSocket 連線
+        // 使用 'ws://' 協議，並指向當前主機的 '/ws' 路徑
+        const socket = new WebSocket('ws://' + window.location.host + '/ws');
+
+        // WebSocket 連線成功時觸發
+        socket.onopen = function(event) {
+            console.log('WebSocket 連線已建立。');
+            statusDiv.textContent = '連線成功！';
+        };
+
+        // 收到來自伺服器的訊息時觸發
+        socket.onmessage = function(event) {
+            console.log('收到伺服器訊息: ' + event.data);
+            // 可以根據伺服器回傳的狀態更新 UI
+            statusDiv.textContent = 'LED 狀態: ' + event.data.split(': ')[1];
+        };
+
+        // WebSocket 連線關閉時觸發
+        socket.onclose = function(event) {
+            console.log('WebSocket 連線已關閉。');
+            statusDiv.textContent = '連線已中斷，請重新整理頁面。';
+            toggleButton.disabled = true; // 禁用按鈕
+        };
+
+        // WebSocket 發生錯誤時觸發
+        socket.onerror = function(error) {
+            console.error('WebSocket 錯誤:', error);
+            statusDiv.textContent = '連線發生錯誤！';
+        };
+
+        // 為按鈕添加點擊事件
+        toggleButton.addEventListener('click', function() {
+            // 檢查連線是否開啟
+            if (socket.readyState === WebSocket.OPEN) {
+                // 發送 'toggle' 指令到伺服器
+                socket.send('toggle');
+                console.log('已發送指令: toggle');
+            } else {
+                statusDiv.textContent = '尚未連線，無法發送指令。';
+            }
+        });
+    </script>
+</body>
+</html>

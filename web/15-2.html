@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 LED 即時控制</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        .container {
+            text-align: center;
+            padding: 30px;
+            border-radius: 10px;
+            background-color: white;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+        }
+        .status {
+            margin-bottom: 20px;
+            font-size: 1.1em;
+        }
+        #led-status {
+            font-weight: bold;
+        }
+        .status .connected { color: green; }
+        .status .disconnected { color: red; }
+        .controls button {
+            font-size: 1em;
+            padding: 10px 20px;
+            margin: 5px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            transition: background-color 0.3s;
+        }
+        .controls button:hover {
+            background-color: #0056b3;
+        }
+        .slider-container {
+            margin-top: 20px;
+        }
+        input[type="range"] {
+            width: 80%;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ESP32 LED 即時控制</h1>
+        <div class="status">
+            WebSocket 狀態: <span id="ws-status" class="disconnected">未連線</span><br>
+            LED 狀態: <span id="led-status">未知</span>
+        </div>
+        <div class="controls">
+            <button id="btnOn">LED 亮</button>
+            <button id="btnOff">LED 滅</button>
+            <button id="btnToggle">LED Toggle</button>
+        </div>
+        <div class="slider-container">
+            <label for="sliderDuty">亮度:</label>
+            <input type="range" id="sliderDuty" min="51" max="1023" value="512" disabled>
+            <span id="dutyPercentage">50%</span>
+        </div>
+    </div>
+
+    <script>
+        const wsStatus = document.getElementById('ws-status');
+        const ledStatus = document.getElementById('led-status');
+        const btnOn = document.getElementById('btnOn');
+        const btnOff = document.getElementById('btnOff');
+        const btnToggle = document.getElementById('btnToggle');
+        const slider = document.getElementById('sliderDuty');
+        const dutyPercentage = document.getElementById('dutyPercentage');
+
+        let ws;
+
+        function connectWebSocket() {
+            // 使用 'ws://' 協定，並獲取當前主機位置
+            ws = new WebSocket(`ws://${window.location.host}/ws`);
+
+            ws.onopen = () => {
+                console.log('WebSocket Connected');
+                wsStatus.textContent = '已連線';
+                wsStatus.className = 'connected';
+            };
+
+            ws.onmessage = (event) => {
+                const state = JSON.parse(event.data);
+                console.log('Received state:', state);
+                updateUI(state);
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket Disconnected');
+                wsStatus.textContent = '已斷線，5秒後重連...';
+                wsStatus.className = 'disconnected';
+                ledStatus.textContent = '未知';
+                slider.disabled = true;
+                setTimeout(connectWebSocket, 5000); // 5秒後嘗試重連
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket Error:', error);
+                ws.close();
+            };
+        }
+
+        function updateUI(state) {
+            if (state.is_on) {
+                ledStatus.textContent = '亮';
+                slider.disabled = false;
+            } else {
+                ledStatus.textContent = '滅';
+                slider.disabled = true;
+            }
+            // 使用從伺服器收到的 duty 值更新滑桿
+            slider.value = state.duty;
+            const percentage = Math.round((state.duty / 1023) * 100);
+            dutyPercentage.textContent = `${percentage}%`;
+        }
+        
+        function sendCommand(command, value = null) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const payload = { command };
+                if (value !== null) {
+                    payload.value = value;
+                }
+                ws.send(JSON.stringify(payload));
+            } else {
+                console.log("WebSocket is not connected.");
+            }
+        }
+
+        btnOn.onclick = () => sendCommand('ON');
+        btnOff.onclick = () => sendCommand('OFF');
+        btnToggle.onclick = () => sendCommand('TOGGLE');
+
+        slider.oninput = () => {
+            const duty = parseInt(slider.value);
+            // 立即更新百分比顯示，提供更好的使用者體驗
+            const percentage = Math.round((duty / 1023) * 100);
+            dutyPercentage.textContent = `${percentage}%`;
+            sendCommand('SET_DUTY', duty);
+        };
+
+        // 頁面載入時啟動 WebSocket 連線
+        connectWebSocket();
+    </script>
+</body>
+</html>

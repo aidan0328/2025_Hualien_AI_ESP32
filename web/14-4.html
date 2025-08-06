@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 LED 控制</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #121212;
+            color: #e0e0e0;
+            text-align: center;
+        }
+        .container {
+            padding: 2rem;
+            background-color: #1e1e1e;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+        h1 {
+            color: #bb86fc;
+            margin-bottom: 1rem;
+        }
+        #status {
+            font-size: 1.5rem;
+            margin: 1.5rem 0;
+            padding: 0.5rem;
+            border-radius: 8px;
+            transition: background-color 0.3s, color 0.3s;
+        }
+        .status-on {
+            background-color: #03dac6;
+            color: #000;
+        }
+        .status-off {
+            background-color: #333;
+            color: #e0e0e0;
+        }
+        #toggleButton {
+            font-size: 1.2rem;
+            padding: 1rem 2rem;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            background-color: #6200ee;
+            color: white;
+            transition: background-color 0.3s;
+        }
+        #toggleButton:hover {
+            background-color: #3700b3;
+        }
+        #ws-status {
+            margin-top: 1.5rem;
+            font-size: 0.9rem;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>💡 LED 即時控制器</h1>
+        <div id="status">正在連接...</div>
+        <button id="toggleButton">Toggle LED</button>
+        <div id="ws-status">WebSocket: 正在連接...</div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const statusDiv = document.getElementById('status');
+            const toggleButton = document.getElementById('toggleButton');
+            const wsStatusDiv = document.getElementById('ws-status');
+            let ws;
+
+            function connectWebSocket() {
+                // 使用目前網頁的 host 來建立 WebSocket 連線
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+                
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {
+                    console.log('WebSocket 連線成功！');
+                    wsStatusDiv.textContent = 'WebSocket: 已連接';
+                    wsStatusDiv.style.color = '#03dac6';
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        console.log('收到伺服器訊息:', data);
+
+                        if (data.type === 'state') {
+                            updateLedStatus(data.value);
+                        }
+                    } catch (e) {
+                        console.error('解析訊息失敗:', e);
+                    }
+                };
+
+                ws.onclose = () => {
+                    console.log('WebSocket 連線已關閉。5秒後嘗試重連...');
+                    wsStatusDiv.textContent = 'WebSocket: 已斷線，5秒後重連...';
+                    wsStatusDiv.style.color = '#cf6679';
+                    statusDiv.textContent = '連線中斷';
+                    statusDiv.className = '';
+                    // 5秒後自動重連
+                    setTimeout(connectWebSocket, 5000);
+                };
+
+                ws.onerror = (error) => {
+                    console.error('WebSocket 發生錯誤:', error);
+                    ws.close(); // 觸發 onclose 的重連機制
+                };
+            }
+
+            function updateLedStatus(state) {
+                if (state === 1) {
+                    statusDiv.textContent = 'LED is ON';
+                    statusDiv.className = 'status-on';
+                } else {
+                    statusDiv.textContent = 'LED is OFF';
+                    statusDiv.className = 'status-off';
+                }
+            }
+
+            toggleButton.addEventListener('click', () => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    // 向伺服器傳送 'toggle' 指令
+                    ws.send('toggle');
+                } else {
+                    alert('WebSocket 尚未連接，請稍候。');
+                }
+            });
+
+            // 啟動 WebSocket 連線
+            connectWebSocket();
+        });
+    </script>
+</body>
+</html>

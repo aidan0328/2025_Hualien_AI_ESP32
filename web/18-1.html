@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WS2812 顏色控制器</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #333;
+            color: #fff;
+        }
+        .container {
+            text-align: center;
+            padding: 30px;
+            border-radius: 15px;
+            background-color: #444;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #00bcd4;
+        }
+        .color-picker-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-top: 20px;
+        }
+        .picker-group {
+            margin: 0 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 10px;
+            font-size: 1.2em;
+        }
+        input[type="color"] {
+            -webkit-appearance: none;
+            width: 80px;
+            height: 80px;
+            border: none;
+            cursor: pointer;
+            padding: 0;
+            background-color: transparent;
+        }
+        input[type="color"]::-webkit-color-swatch-wrapper {
+            padding: 0;
+        }
+        input[type="color"]::-webkit-color-swatch {
+            border: 2px solid #fff;
+            border-radius: 50%;
+        }
+        #status {
+            margin-top: 25px;
+            font-style: italic;
+            color: #aaa;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>WS2812 LED 顏色控制器</h1>
+        <div class="color-picker-container">
+            <div class="picker-group">
+                <label for="color-picker-0">LED 1 顏色</label>
+                <input type="color" id="color-picker-0" data-led-index="0" value="#000000">
+            </div>
+            <div class="picker-group">
+                <label for="color-picker-1">LED 2 顏色</label>
+                <input type="color" id="color-picker-1" data-led-index="1" value="#000000">
+            </div>
+        </div>
+        <p id="status">正在連線到 ESP32...</p>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const statusElem = document.getElementById('status');
+            const colorPickers = document.querySelectorAll('input[type="color"]');
+            let ws;
+
+            function updateStatus(message) {
+                statusElem.textContent = message;
+            }
+
+            function connectWebSocket() {
+                const wsUrl = `ws://${window.location.host}/ws`;
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {
+                    updateStatus('已連線！請選擇顏色。');
+                    console.log('WebSocket 連線已建立');
+                };
+
+                ws.onmessage = (event) => {
+                    // 在此專案中，我們不預期從伺服器接收常規訊息
+                    console.log('收到訊息:', event.data);
+                };
+                
+                ws.onclose = () => {
+                    updateStatus('連線已中斷，3秒後嘗試重新連線...');
+                    console.log('WebSocket 連線已關閉');
+                    setTimeout(connectWebSocket, 3000);
+                };
+
+                ws.onerror = (error) => {
+                    updateStatus('連線發生錯誤');
+                    console.error('WebSocket 錯誤:', error);
+                    ws.close();
+                };
+            }
+
+            function sendColor(ledIndex, color) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const data = {
+                        led_index: ledIndex,
+                        color: color
+                    };
+                    ws.send(JSON.stringify(data));
+                } else {
+                    console.log('WebSocket 未連線，無法傳送顏色。');
+                }
+            }
+
+            colorPickers.forEach(picker => {
+                // 'input' 事件會在顏色改變時即時觸發
+                picker.addEventListener('input', (event) => {
+                    const ledIndex = parseInt(event.target.getAttribute('data-led-index'));
+                    const colorValue = event.target.value;
+                    sendColor(ledIndex, colorValue);
+                });
+            });
+
+            // 啟動 WebSocket 連線
+            connectWebSocket();
+        });
+    </script>
+
+</body>
+</html>

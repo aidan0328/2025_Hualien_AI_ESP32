@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 圖片播放器</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        #image-container {
+            max-width: 90%;
+            max-height: 70vh;
+            margin-bottom: 20px;
+            border: 5px solid #fff;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        #image-display {
+            max-width: 100%;
+            max-height: 100%;
+            display: block;
+        }
+        #controls {
+            display: flex;
+            gap: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border: 2px solid #007bff;
+            background-color: white;
+            color: #007bff;
+            border-radius: 5px;
+            transition: all 0.3s ease;
+        }
+        button:hover {
+            background-color: #007bff;
+            color: white;
+        }
+        #image-info {
+            margin-top: 15px;
+            font-size: 14px;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <h1>ESP32 圖片播放器</h1>
+    <div id="image-container">
+        <img id="image-display" src="" alt="請稍候...">
+    </div>
+    <div id="controls">
+        <button id="prev-btn">前一張</button>
+        <button id="next-btn">下一張</button>
+    </div>
+    <div id="image-info"></div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const imageDisplay = document.getElementById('image-display');
+            const prevBtn = document.getElementById('prev-btn');
+            const nextBtn = document.getElementById('next-btn');
+            const imageInfo = document.getElementById('image-info');
+            
+            let ws;
+            let imageList = [];
+            let currentIndex = 0;
+
+            function updateImage() {
+                if (imageList.length === 0) {
+                    imageDisplay.alt = '沒有找到圖片。';
+                    imageInfo.textContent = '0 / 0';
+                    return;
+                }
+                const imageName = imageList[currentIndex];
+                imageDisplay.src = `/image/${imageName}`;
+                imageDisplay.alt = imageName;
+                imageInfo.textContent = `${currentIndex + 1} / ${imageList.length} - ${imageName}`;
+            }
+
+            function connectWebSocket() {
+                // 使用 window.location.host 來自動偵測 IP 位址和埠號
+                const wsUrl = `ws://${window.location.host}/ws`;
+                console.log(`Connecting to WebSocket at: ${wsUrl}`);
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {
+                    console.log('WebSocket connected!');
+                    imageInfo.textContent = '已連接，正在載入圖片列表...';
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const message = JSON.parse(event.data);
+                        console.log('Received message:', message);
+                        
+                        if (message.type === 'imageList' && Array.isArray(message.data)) {
+                            imageList = message.data;
+                            if (imageList.length > 0) {
+                                currentIndex = 0;
+                                updateImage();
+                            } else {
+                                console.log('Image list is empty.');
+                                updateImage();
+                            }
+                        }
+                    } catch (e) {
+                        console.error('Error parsing WebSocket message:', e);
+                    }
+                };
+
+                ws.onclose = () => {
+                    console.log('WebSocket disconnected. Reconnecting in 3 seconds...');
+                    imageInfo.textContent = '連線中斷，3秒後重新連線...';
+                    setTimeout(connectWebSocket, 3000);
+                };
+
+                ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    ws.close(); // 會觸發 onclose 事件來重新連線
+                };
+            }
+
+            prevBtn.addEventListener('click', () => {
+                if (imageList.length === 0) return;
+                // 處理負數索引，確保能正確循環
+                currentIndex = (currentIndex - 1 + imageList.length) % imageList.length;
+                updateImage();
+            });
+
+            nextBtn.addEventListener('click', () => {
+                if (imageList.length === 0) return;
+                currentIndex = (currentIndex + 1) % imageList.length;
+                updateImage();
+            });
+
+            // 啟動 WebSocket 連線
+            connectWebSocket();
+        });
+    </script>
+</body>
+</html>

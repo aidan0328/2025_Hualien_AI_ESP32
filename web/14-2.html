@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 LED 切換控制</title>
+    <style>
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #2c3e50;
+            color: #ecf0f1;
+        }
+        .container {
+            text-align: center;
+            padding: 40px;
+            background-color: #34495e;
+            border-radius: 20px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+        }
+        h1 { 
+            color: #1abc9c; 
+        }
+        #toggleBtn {
+            padding: 20px 40px;
+            font-size: 24px;
+            font-weight: bold;
+            cursor: pointer;
+            border: none;
+            border-radius: 10px;
+            background-color: #3498db;
+            color: white;
+            transition: background-color 0.3s, transform 0.1s;
+            box-shadow: 0 5px #2980b9;
+        }
+        #toggleBtn:active {
+            transform: translateY(3px);
+            box-shadow: 0 2px #2980b9;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ESP32 LED 控制面板</h1>
+        <p>點擊按鈕來切換 LED 的狀態。</p>
+        <button id="toggleBtn">切換 LED</button>
+    </div>
+
+    <script>
+        // 獲取按鈕元素
+        const toggleButton = document.getElementById('toggleBtn');
+
+        // 為按鈕添加點擊事件監聽器
+        toggleButton.addEventListener('click', function() {
+            // 使用 fetch API 向後端發送 POST 請求
+            fetch('/led/toggle', {
+                method: 'POST'
+            })
+            .then(response => {
+                if (!response.ok) {
+                    // 如果伺服器回應不正常，拋出錯誤
+                    throw new Error('網路回應不正常');
+                }
+                console.log('指令已發送: 切換 LED');
+            })
+            .catch(error => {
+                // 處理 fetch 過程中的錯誤
+                console.error('發送指令時發生錯誤:', error);
+            });
+        });
+    </script>
+</body>
+</html>
