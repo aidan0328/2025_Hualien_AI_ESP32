@@ -3,14 +3,17 @@
 
 ### 課程簡報 ###
 
-EPS32 開發環境設置
+Day#1 EPS32 開發環境設置
 
-https://www.canva.com/design/DAGrDr6ZoeY/np7ucZlnauiyTQtiAi3peA/edit?utm_content=DAGrDr6ZoeY&utm_campaign=designshare&utm_medium=link2&utm_source=sharebutton
+https://www.canva.com/design/DAGrDr6ZoeY/np7ucZlnauiyTQtiAi3peA/edit
 
-用ESP32 驅動各種感測器
+Day#1 用ESP32 驅動各種感測器
 
-https://www.canva.com/design/DAGrEgIrvuk/RHjSjK7Z-8kqHXB2ctPBbA/edit?utm_content=DAGrEgIrvuk&utm_campaign=designshare&utm_medium=link2&utm_source=sharebutton
+https://www.canva.com/design/DAGrEgIrvuk/RHjSjK7Z-8kqHXB2ctPBbA/edit
 
+Day#2 ESP32 網頁篇與 ESP NOW
+
+https://www.canva.com/design/DAGtbF00yVI/OjxD6AKOw6J4qPYUH6Kn9A/edit
 
 ### 其他資源 ###
 
