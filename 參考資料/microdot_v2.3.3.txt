@@ -1,0 +1,3760 @@
+--- 目錄結構 ---
+microdot
+└── 📁 microdot
+    ├── 📄 __init__.py
+    ├── 📄 asgi.py
+    ├── 📄 auth.py
+    ├── 📄 cors.py
+    ├── 📄 helpers.py
+    ├── 📄 jinja.py
+    ├── 📄 login.py
+    ├── 📄 microdot.py
+    ├── 📄 multipart.py
+    ├── 📄 session.py
+    ├── 📄 sse.py
+    ├── 📄 test_client.py
+    ├── 📄 utemplate.py
+    ├── 📄 websocket.py
+    └── 📄 wsgi.py
+
+--- 檔案內容 ---
+
+路徑/microdot/__init__.py內容如下：
+from microdot.microdot import Microdot, Request, Response, abort, redirect, \
+    send_file, URLPattern, AsyncBytesIO, iscoroutine  # noqa: F401
+
+
+路徑/microdot/asgi.py內容如下：
+import asyncio
+import os
+import signal
+from microdot import *  # noqa: F401, F403
+from microdot.microdot import Microdot as BaseMicrodot, Request, Response, \
+    NoCaseDict, abort
+from microdot.websocket import WebSocket as BaseWebSocket, websocket_wrapper
+
+
+class _BodyStream:  # pragma: no cover
+    def __init__(self, receive):
+        self.receive = receive
+        self.data = b''
+        self.more = True
+
+    async def read_more(self):
+        if self.more:
+            packet = await self.receive()
+            self.data += packet.get('body', b'')
+            self.more = packet.get('more_body', False)
+
+    async def read(self, n=-1):
+        while self.more and len(self.data) < n:
+            await self.read_more()
+        if len(self.data) < n:
+            data = self.data
+            self.data = b''
+            return data
+
+        data = self.data[:n]
+        self.data = self.data[n:]
+        return data
+
+    async def readline(self):
+        return await self.readuntil()
+
+    async def readexactly(self, n):
+        return await self.read(n)
+
+    async def readuntil(self, separator=b'\n'):
+        if self.more and separator not in self.data:
+            await self.read_more()
+        data, self.data = self.data.split(separator, 1)
+        return data
+
+
+class Microdot(BaseMicrodot):
+    """A subclass of the core :class:`Microdot <microdot.Microdot>` class that
+    implements the ASGI protocol.
+
+    This class must be used as the application instance when running under an
+    ASGI web server.
+    """
+    def __init__(self):
+        super().__init__()
+        self.embedded_server = False
+
+    async def asgi_app(self, scope, receive, send):
+        """An ASGI application."""
+        if scope['type'] not in ['http', 'websocket']:  # pragma: no cover
+            return
+        path = scope['path']
+        if 'query_string' in scope and scope['query_string']:
+            path += '?' + scope['query_string'].decode()
+        headers = NoCaseDict()
+        content_length = 0
+        for key, value in scope.get('headers', []):
+            key = key.decode().title()
+            headers[key] = value.decode()
+            if key == 'Content-Length':
+                content_length = int(value)
+
+        if content_length and content_length <= Request.max_body_length:
+            body = b''
+            more = True
+            while more:
+                packet = await receive()
+                body += packet.get('body', b'')
+                more = packet.get('more_body', False)
+            stream = None
+        else:
+            body = b''
+            stream = _BodyStream(receive)
+
+        req = Request(
+            self,
+            (scope['client'][0], scope['client'][1]),
+            scope.get('method', 'GET'),
+            path,
+            'HTTP/' + scope['http_version'],
+            headers,
+            body=body,
+            stream=stream,
+            sock=(receive, send))
+        req.asgi_scope = scope
+
+        res = await self.dispatch_request(req)
+        res.complete()
+
+        header_list = []
+        for name, value in res.headers.items():
+            if not isinstance(value, list):
+                header_list.append((name.lower().encode(), value.encode()))
+            else:
+                for v in value:
+                    header_list.append((name.lower().encode(), v.encode()))
+
+        if scope['type'] != 'http':  # pragma: no cover
+            return
+
+        await send({'type': 'http.response.start',
+                    'status': res.status_code,
+                    'headers': header_list})
+
+        cancelled = False
+
+        async def cancel_monitor():
+            nonlocal cancelled
+
+            while True:
+                event = await receive()
+                if event is None or \
+                        event['type'] == 'http.disconnect':  # pragma: no cover
+                    cancelled = True
+                    break
+
+        monitor_task = asyncio.ensure_future(cancel_monitor())
+
+        body_iter = res.body_iter().__aiter__()
+        res_body = b''
+        try:
+            res_body = await body_iter.__anext__()
+            while not cancelled:  # pragma: no branch
+                next_body = await body_iter.__anext__()
+                await send({'type': 'http.response.body',
+                            'body': res_body,
+                            'more_body': True})
+                res_body = next_body
+        except StopAsyncIteration:
+            await send({'type': 'http.response.body',
+                        'body': res_body,
+                        'more_body': False})
+        if hasattr(body_iter, 'aclose'):  # pragma: no branch
+            await body_iter.aclose()
+        cancelled = True
+        await monitor_task
+
+    async def __call__(self, scope, receive, send):
+        return await self.asgi_app(scope, receive, send)
+
+    def shutdown(self):
+        if self.embedded_server:  # pragma: no cover
+            super().shutdown()
+        else:
+            pid = os.getpgrp() if hasattr(os, 'getpgrp') else os.getpid()
+            os.kill(pid, signal.SIGTERM)
+
+    def run(self, host='0.0.0.0', port=5000, debug=False,
+            **options):  # pragma: no cover
+        """Normally you would not start the server by invoking this method.
+        Instead, start your chosen ASGI web server and pass the ``Microdot``
+        instance as the ASGI application.
+        """
+        self.embedded_server = True
+        super().run(host=host, port=port, debug=debug, **options)
+
+
+class WebSocket(BaseWebSocket):  # pragma: no cover
+    async def handshake(self):
+        connect = await self.request.sock[0]()
+        if connect['type'] != 'websocket.connect':
+            abort(400)
+        await self.request.sock[1]({'type': 'websocket.accept'})
+
+    async def receive(self):
+        message = await self.request.sock[0]()
+        if message['type'] == 'websocket.disconnect':
+            raise OSError(32, 'Websocket connection closed')
+        elif message['type'] != 'websocket.receive':
+            raise OSError(32, 'Websocket message type not supported')
+        return message.get('bytes', message.get('text'))
+
+    async def send(self, data):
+        if isinstance(data, str):
+            await self.request.sock[1](
+                {'type': 'websocket.send', 'text': data})
+        else:
+            await self.request.sock[1](
+                {'type': 'websocket.send', 'bytes': data})
+
+    async def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                await self.request.sock[1]({'type': 'websocket.close'})
+            except:  # noqa E722
+                pass
+
+
+async def websocket_upgrade(request):  # pragma: no cover
+    """Upgrade a request handler to a websocket connection.
+
+    This function can be called directly inside a route function to process a
+    WebSocket upgrade handshake, for example after the user's credentials are
+    verified. The function returns the websocket object::
+
+        @app.route('/echo')
+        async def echo(request):
+            if not (await authenticate_user(request)):
+                abort(401)
+            ws = await websocket_upgrade(request)
+            while True:
+                message = await ws.receive()
+                await ws.send(message)
+    """
+    ws = WebSocket(request) if not request.app.embedded_server else \
+        BaseWebSocket(request)
+    await ws.handshake()
+
+    @request.after_request
+    async def after_request(request, response):
+        return Response.already_handled
+
+    return ws
+
+
+def with_websocket(f):  # pragma: no cover
+    """Decorator to make a route a WebSocket endpoint.
+
+    This decorator is used to define a route that accepts websocket
+    connections. The route then receives a websocket object as a second
+    argument that it can use to send and receive messages::
+
+        @app.route('/echo')
+        @with_websocket
+        async def echo(request, ws):
+            while True:
+                message = await ws.receive()
+                await ws.send(message)
+    """
+    return websocket_wrapper(f, websocket_upgrade)
+
+
+路徑/microdot/auth.py內容如下：
+from microdot import abort
+from microdot.microdot import invoke_handler
+
+
+class BaseAuth:
+    def __init__(self):
+        self.auth_callback = None
+        self.error_callback = None
+
+    def __call__(self, f):
+        """Decorator to protect a route with authentication.
+
+        An instance of this class must be used as a decorator on the routes
+        that need to be protected. Example::
+
+           auth = BasicAuth()  # or TokenAuth()
+
+           @app.route('/protected')
+           @auth
+           def protected(request):
+               # ...
+
+        Routes that are decorated in this way will only be invoked if the
+        authentication callback returned a valid user object, otherwise the
+        error callback will be executed.
+        """
+        async def wrapper(request, *args, **kwargs):
+            auth = self._get_auth(request)
+            if not auth:
+                return await invoke_handler(self.error_callback, request)
+            request.g.current_user = await invoke_handler(
+                self.auth_callback, request, *auth)
+            if not request.g.current_user:
+                return await invoke_handler(self.error_callback, request)
+            return await invoke_handler(f, request, *args, **kwargs)
+
+        return wrapper
+
+    def optional(self, f):
+        """Decorator to protect a route with optional authentication.
+
+        This decorator makes authentication for the decorated route optional,
+        meaning that the route is allowed to run with or with
+        authentication given in the request.
+        """
+        async def wrapper(request, *args, **kwargs):
+            auth = self._get_auth(request)
+            if not auth:
+                request.g.current_user = None
+            else:
+                request.g.current_user = await invoke_handler(
+                    self.auth_callback, request, *auth)
+            return await invoke_handler(f, request, *args, **kwargs)
+
+        return wrapper
+
+
+class BasicAuth(BaseAuth):
+    """Basic Authentication.
+
+    :param realm: The realm that is displayed when the user is prompted to
+                  authenticate in the browser.
+    :param charset: The charset that is used to encode the realm.
+    :param scheme: The authentication scheme. Defaults to 'Basic'.
+    :param error_status: The error status code to return when authentication
+                         fails. Defaults to 401.
+    """
+    def __init__(self, realm='Please login', charset='UTF-8', scheme='Basic',
+                 error_status=401):
+        super().__init__()
+        self.realm = realm
+        self.charset = charset
+        self.scheme = scheme
+        self.error_status = error_status
+        self.error_callback = self.authentication_error
+
+    def _get_auth(self, request):
+        auth = request.headers.get('Authorization')
+        if auth and auth.startswith('Basic '):
+            import binascii
+            try:
+                username, password = binascii.a2b_base64(
+                    auth[6:]).decode().split(':', 1)
+            except Exception:  # pragma: no cover
+                return None
+            return username, password
+
+    async def authentication_error(self, request):
+        return '', self.error_status, {
+            'WWW-Authenticate': '{} realm="{}", charset="{}"'.format(
+                self.scheme, self.realm, self.charset)}
+
+    def authenticate(self, f):
+        """Decorator to configure the authentication callback.
+
+        This decorator must be used with a function that accepts the request
+        object, a username and a password and returns a user object if the
+        credentials are valid, or ``None`` if they are not. Example::
+
+           @auth.authenticate
+           async def check_credentials(request, username, password):
+               user = get_user(username)
+               if user and user.check_password(password):
+                   return get_user(username)
+        """
+        self.auth_callback = f
+
+
+class TokenAuth(BaseAuth):
+    """Token based authentication.
+
+    :param header: The name of the header that will contain the token. Defaults
+                   to 'Authorization'.
+    :param scheme: The authentication scheme. Defaults to 'Bearer'.
+    :param error_status: The error status code to return when authentication
+                         fails. Defaults to 401.
+    """
+    def __init__(self, header='Authorization', scheme='Bearer',
+                 error_status=401):
+        super().__init__()
+        self.header = header
+        self.scheme = scheme.lower()
+        self.error_status = error_status
+        self.error_callback = self.authentication_error
+
+    def _get_auth(self, request):
+        auth = request.headers.get(self.header)
+        if auth:
+            if self.header == 'Authorization':
+                try:
+                    scheme, token = auth.split(' ', 1)
+                except Exception:
+                    return None
+                if scheme.lower() == self.scheme:
+                    return (token.strip(),)
+            else:
+                return (auth,)
+
+    def authenticate(self, f):
+        """Decorator to configure the authentication callback.
+
+        This decorator must be used with a function that accepts the request
+        object, a username and a password and returns a user object if the
+        credentials are valid, or ``None`` if they are not. Example::
+
+           @auth.authenticate
+           async def check_credentials(request, token):
+               return get_user(token)
+        """
+        self.auth_callback = f
+
+    def errorhandler(self, f):
+        """Decorator to configure the error callback.
+
+        Microdot calls the error callback to allow the application to generate
+        a custom error response. The default error response is to call
+        ``abort(401)``.
+        """
+        self.error_callback = f
+
+    async def authentication_error(self, request):
+        abort(self.error_status)
+
+
+路徑/microdot/cors.py內容如下：
+class CORS:
+    """Add CORS headers to HTTP responses.
+
+    :param app: The application to add CORS headers to.
+    :param allowed_origins: A list of origins that are allowed to make
+                            cross-site requests. If set to '*', all origins are
+                            allowed.
+    :param allow_credentials: If set to True, the
+                              ``Access-Control-Allow-Credentials`` header will
+                              be set to ``true`` to indicate to the browser
+                              that it can expose cookies and authentication
+                              headers.
+    :param allowed_methods: A list of methods that are allowed to be used when
+                            making cross-site requests. If not set, all methods
+                            are allowed.
+    :param expose_headers: A list of headers that the browser is allowed to
+                           exposed.
+    :param allowed_headers: A list of headers that are allowed to be used when
+                            making cross-site requests. If not set, all headers
+                            are allowed.
+    :param max_age: The maximum amount of time in seconds that the browser
+                    should cache the results of a preflight request.
+    :param handle_cors: If set to False, CORS headers will not be added to
+                        responses. This can be useful if you want to add CORS
+                        headers manually.
+    """
+    def __init__(self, app=None, allowed_origins=None, allow_credentials=False,
+                 allowed_methods=None, expose_headers=None,
+                 allowed_headers=None, max_age=None, handle_cors=True):
+        self.allowed_origins = allowed_origins
+        self.allow_credentials = allow_credentials
+        self.allowed_methods = allowed_methods
+        self.expose_headers = expose_headers
+        self.allowed_headers = None if allowed_headers is None \
+            else [h.lower() for h in allowed_headers]
+        self.max_age = max_age
+        if app is not None:
+            self.initialize(app, handle_cors=handle_cors)
+
+    def initialize(self, app, handle_cors=True):
+        """Initialize the CORS object for the given application.
+
+        :param app: The application to add CORS headers to.
+        :param handle_cors: If set to False, CORS headers will not be added to
+                            responses. This can be useful if you want to add
+                            CORS headers manually.
+        """
+        self.default_options_handler = app.options_handler
+        if handle_cors:
+            app.options_handler = self.options_handler
+            app.after_request(self.after_request)
+            app.after_error_request(self.after_request)
+
+    def options_handler(self, request):
+        headers = self.default_options_handler(request)
+        headers.update(self.get_cors_headers(request))
+        return headers
+
+    def get_cors_headers(self, request):
+        """Return a dictionary of CORS headers to add to a given request.
+
+        :param request: The request to add CORS headers to.
+        """
+        cors_headers = {}
+        origin = request.headers.get('Origin')
+        if self.allowed_origins == '*':
+            cors_headers['Access-Control-Allow-Origin'] = origin or '*'
+            if origin:
+                cors_headers['Vary'] = 'Origin'
+        elif origin in (self.allowed_origins or []):
+            cors_headers['Access-Control-Allow-Origin'] = origin
+            cors_headers['Vary'] = 'Origin'
+        if self.allow_credentials and \
+                'Access-Control-Allow-Origin' in cors_headers:
+            cors_headers['Access-Control-Allow-Credentials'] = 'true'
+        if self.expose_headers:
+            cors_headers['Access-Control-Expose-Headers'] = \
+                ', '.join(self.expose_headers)
+
+        if request.method == 'OPTIONS':
+            # handle preflight request
+            if self.max_age:
+                cors_headers['Access-Control-Max-Age'] = str(self.max_age)
+
+            method = request.headers.get('Access-Control-Request-Method')
+            if method:
+                method = method.upper()
+                if self.allowed_methods is None or \
+                        method in self.allowed_methods:
+                    cors_headers['Access-Control-Allow-Methods'] = method
+
+            headers = request.headers.get('Access-Control-Request-Headers')
+            if headers:
+                if self.allowed_headers is None:
+                    cors_headers['Access-Control-Allow-Headers'] = headers
+                else:
+                    headers = [h.strip() for h in headers.split(',')]
+                    headers = [h for h in headers
+                               if h.lower() in self.allowed_headers]
+                    cors_headers['Access-Control-Allow-Headers'] = \
+                        ', '.join(headers)
+
+        return cors_headers
+
+    def after_request(self, request, response):
+        saved_vary = response.headers.get('Vary')
+        response.headers.update(self.get_cors_headers(request))
+        if saved_vary and saved_vary != response.headers.get('Vary'):
+            response.headers['Vary'] = (
+                saved_vary + ', ' + response.headers['Vary'])
+
+
+路徑/microdot/helpers.py內容如下：
+try:
+    from functools import wraps
+except ImportError:  # pragma: no cover
+    # MicroPython does not currently implement functools.wraps
+    def wraps(wrapped):
+        def _(wrapper):
+            return wrapper
+        return _
+
+
+路徑/microdot/jinja.py內容如下：
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+
+class Template:
+    """A template object.
+
+    :param template: The filename of the template to render, relative to the
+                     configured template directory.
+    :param kwargs: any additional options to be passed to the Jinja
+                   environment's ``get_template()`` method.
+    """
+    #: The Jinja environment. The ``initialize()`` method must be called before
+    #: this attribute is accessed.
+    jinja_env = None
+
+    @classmethod
+    def initialize(cls, template_dir='templates', enable_async=False,
+                   **kwargs):
+        """Initialize the templating subsystem.
+
+        This method is automatically invoked when the first template is
+        created. The application can call it explicitly if custom options need
+        to be provided.
+
+        :param template_dir: the directory where templates are stored. This
+                             argument is optional. The default is to load
+                             templates from a *templates* subdirectory.
+        :param enable_async: set to ``True`` to enable the async rendering
+                             engine in Jinja, and the ``render_async()`` and
+                             ``generate_async()`` methods.
+        :param kwargs: any additional options to be passed to Jinja's
+                       ``Environment`` class.
+        """
+        cls.jinja_env = Environment(
+            loader=FileSystemLoader(template_dir),
+            autoescape=select_autoescape(),
+            enable_async=enable_async,
+            **kwargs
+        )
+
+    def __init__(self, template, **kwargs):
+        if self.jinja_env is None:  # pragma: no cover
+            self.initialize()
+        #: The name of the template.
+        self.name = template
+        self.template = self.jinja_env.get_template(template, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        """Return a generator that renders the template in chunks, with the
+        given arguments."""
+        return self.template.generate(*args, **kwargs)
+
+    def render(self, *args, **kwargs):
+        """Render the template with the given arguments and return it as a
+        string."""
+        return self.template.render(*args, **kwargs)
+
+    def generate_async(self, *args, **kwargs):
+        """Return an asynchronous generator that renders the template in
+        chunks, using the given arguments."""
+        return self.template.generate_async(*args, **kwargs)
+
+    async def render_async(self, *args, **kwargs):
+        """Render the template with the given arguments asynchronously and
+        return it as a string."""
+        return await self.template.render_async(*args, **kwargs)
+
+
+路徑/microdot/login.py內容如下：
+from time import time
+from microdot import redirect
+from microdot.microdot import urlencode, invoke_handler
+
+
+class Login:
+    """User login support for Microdot.
+
+    :param login_url: the URL to redirect to when a login is required. The
+                      default is '/login'.
+    """
+    def __init__(self, login_url='/login'):
+        self.login_url = login_url
+        self.user_loader_callback = None
+
+    def user_loader(self, f):
+        """Decorator to configure the user callback.
+
+        The decorated function receives the user ID as an argument and must
+        return the corresponding user object, or ``None`` if the user ID is
+        invalid.
+        """
+        self.user_loader_callback = f
+
+    def _get_session(self, request):
+        return request.app._session.get(request)
+
+    def _update_remember_cookie(self, request, days, user_id=None):
+        remember_payload = request.app._session.encode({
+            'user_id': user_id,
+            'days': days,
+            'exp': time() + days * 24 * 60 * 60
+        })
+
+        @request.after_request
+        async def _set_remember_cookie(request, response):
+            response.set_cookie('_remember', remember_payload,
+                                max_age=days * 24 * 60 * 60)
+            return response
+
+    def _get_user_id_from_session(self, request):
+        session = self._get_session(request)
+        if session and '_user_id' in session:
+            return session['_user_id']
+        if '_remember' in request.cookies:
+            remember_payload = request.app._session.decode(
+                request.cookies['_remember'])
+            user_id = remember_payload.get('user_id')
+            if user_id:  # pragma: no branch
+                self._update_remember_cookie(
+                    request, remember_payload.get('_days', 30), user_id)
+                session['_user_id'] = user_id
+                session['_fresh'] = False
+                session.save()
+                return user_id
+
+    async def _redirect_to_login(self, request):
+        return '', 302, {'Location': self.login_url + '?next=' + urlencode(
+            request.url)}
+
+    async def login_user(self, request, user, remember=False,
+                         redirect_url='/'):
+        """Log a user in.
+
+        :param request: the request object
+        :param user: the user object
+        :param remember: if the user's logged in state should be remembered
+                         with a cookie after the session ends. Set to the
+                         number of days the remember cookie should last, or to
+                         ``True`` to use a default duration of 30 days.
+        :param redirect_url: the URL to redirect to after login
+
+        This call marks the user as logged in by storing their user ID in the
+        user session. The application must call this method to log a user in
+        after their credentials have been validated.
+
+        The method returns a redirect response, either to the URL the user
+        originally intended to visit, or if there is no original URL to the URL
+        specified by the `redirect_url`.
+        """
+        session = self._get_session(request)
+        session['_user_id'] = user.id
+        session['_fresh'] = True
+        session.save()
+
+        if remember:
+            days = 30 if remember is True else int(remember)
+            self._update_remember_cookie(request, days, session['_user_id'])
+
+        next_url = request.args.get('next', redirect_url)
+        if not next_url.startswith('/'):
+            next_url = redirect_url
+        return redirect(next_url)
+
+    async def logout_user(self, request):
+        """Log a user out.
+
+        :param request: the request object
+
+        This call removes information about the user's log in from the user
+        session. If a remember cookie exists, it is removed as well.
+        """
+        session = self._get_session(request)
+        session.pop('_user_id', None)
+        session.pop('_fresh', None)
+        session.save()
+        if '_remember' in request.cookies:
+            self._update_remember_cookie(request, 0)
+
+    def __call__(self, f):
+        """Decorator to protect a route with authentication.
+
+        If the user is not logged in, Microdot will redirect to the login page
+        first. The decorated route will only run after successful login by the
+        user. If the user is already logged in, the route will run immediately.
+        Example::
+
+            login = Login()
+
+            @app.route('/secret')
+            @login
+            async def secret(request):
+                # only accessible to authenticated users
+
+        """
+        async def wrapper(request, *args, **kwargs):
+            user_id = self._get_user_id_from_session(request)
+            if not user_id:
+                return await self._redirect_to_login(request)
+            request.g.current_user = await invoke_handler(
+                self.user_loader_callback, user_id)
+            if not request.g.current_user:
+                return await self._redirect_to_login(request)
+            return await invoke_handler(f, request, *args, **kwargs)
+
+        return wrapper
+
+    def fresh(self, f):
+        """Decorator to protect a route with "fresh" authentication.
+
+        This decorator prevents the route from running when the login session
+        is not fresh. A fresh session is a session that has been created from
+        direct user interaction with the login page, while a non-fresh session
+        occurs when a login is restored from a "remember me" cookie. Example::
+
+            login = Login()
+
+            @app.route('/secret')
+            @auth.fresh
+            async def secret(request):
+                # only accessible to authenticated users
+                # users logged in via remember me cookie will need to
+                # re-authenticate
+        """
+        base_wrapper = self.__call__(f)
+
+        async def wrapper(request, *args, **kwargs):
+            session = self._get_session(request)
+            if session.get('_fresh'):
+                return await base_wrapper(request, *args, **kwargs)
+            return await self._redirect_to_login(request)
+
+        return wrapper
+
+
+路徑/microdot/microdot.py內容如下：
+"""
+microdot
+--------
+
+The ``microdot`` module defines a few classes that help implement HTTP-based
+servers for MicroPython and standard Python.
+"""
+import asyncio
+import io
+import re
+import time
+
+try:
+    import orjson as json
+except ImportError:
+    import json
+
+try:
+    from inspect import iscoroutinefunction, iscoroutine
+    from functools import partial
+
+    async def invoke_handler(handler, *args, **kwargs):
+        """Invoke a handler and return the result.
+
+        This method runs sync handlers in a thread pool executor.
+        """
+        if iscoroutinefunction(handler):
+            ret = await handler(*args, **kwargs)
+        else:
+            ret = await asyncio.get_running_loop().run_in_executor(
+                None, partial(handler, *args, **kwargs))
+        return ret
+except ImportError:  # pragma: no cover
+    def iscoroutine(coro):
+        return hasattr(coro, 'send') and hasattr(coro, 'throw')
+
+    async def invoke_handler(handler, *args, **kwargs):
+        """Invoke a handler and return the result.
+
+        This method runs sync handlers in the asyncio thread, which can
+        potentially cause blocking and performance issues.
+        """
+        ret = handler(*args, **kwargs)
+        if iscoroutine(ret):
+            ret = await ret
+        return ret
+
+try:
+    from sys import print_exception
+except ImportError:  # pragma: no cover
+    import traceback
+
+    def print_exception(exc):
+        traceback.print_exc()
+
+MUTED_SOCKET_ERRORS = [
+    32,  # Broken pipe
+    54,  # Connection reset by peer
+    104,  # Connection reset by peer
+    128,  # Operation on closed socket
+]
+
+
+def urldecode(s):
+    if isinstance(s, str):
+        s = s.encode()
+    s = s.replace(b'+', b' ')
+    parts = s.split(b'%')
+    if len(parts) == 1:
+        return s.decode()
+    result = [parts[0]]
+    for item in parts[1:]:
+        if item == b'':
+            result.append(b'%')
+        else:
+            code = item[:2]
+            result.append(bytes([int(code, 16)]))
+            result.append(item[2:])
+    return b''.join(result).decode()
+
+
+def urlencode(s):
+    return s.replace('+', '%2B').replace(' ', '+').replace(
+        '%', '%25').replace('?', '%3F').replace('#', '%23').replace(
+            '&', '%26').replace('=', '%3D')
+
+
+class NoCaseDict(dict):
+    """A subclass of dictionary that holds case-insensitive keys.
+
+    :param initial_dict: an initial dictionary of key/value pairs to
+                         initialize this object with.
+
+    Example::
+
+        >>> d = NoCaseDict()
+        >>> d['Content-Type'] = 'text/html'
+        >>> print(d['Content-Type'])
+        text/html
+        >>> print(d['content-type'])
+        text/html
+        >>> print(d['CONTENT-TYPE'])
+        text/html
+        >>> del d['cOnTeNt-TyPe']
+        >>> print(d)
+        {}
+    """
+    def __init__(self, initial_dict=None):
+        super().__init__(initial_dict or {})
+        self.keymap = {k.lower(): k for k in self.keys() if k.lower() != k}
+
+    def __setitem__(self, key, value):
+        kl = key.lower()
+        key = self.keymap.get(kl, key)
+        if kl != key:
+            self.keymap[kl] = key
+        super().__setitem__(key, value)
+
+    def __getitem__(self, key):
+        kl = key.lower()
+        return super().__getitem__(self.keymap.get(kl, kl))
+
+    def __delitem__(self, key):
+        kl = key.lower()
+        super().__delitem__(self.keymap.get(kl, kl))
+
+    def __contains__(self, key):
+        kl = key.lower()
+        return self.keymap.get(kl, kl) in self.keys()
+
+    def get(self, key, default=None):
+        kl = key.lower()
+        return super().get(self.keymap.get(kl, kl), default)
+
+    def update(self, other_dict):
+        for key, value in other_dict.items():
+            self[key] = value
+
+
+def mro(cls):  # pragma: no cover
+    """Return the method resolution order of a class.
+
+    This is a helper function that returns the method resolution order of a
+    class. It is used by Microdot to find the best error handler to invoke for
+    the raised exception.
+
+    In CPython, this function returns the ``__mro__`` attribute of the class.
+    In MicroPython, this function implements a recursive depth-first scanning
+    of the class hierarchy.
+    """
+    if hasattr(cls, 'mro'):
+        return cls.__mro__
+
+    def _mro(cls):
+        m = [cls]
+        for base in cls.__bases__:
+            m += _mro(base)
+        return m
+
+    mro_list = _mro(cls)
+
+    # If a class appears multiple times (due to multiple inheritance) remove
+    # all but the last occurence. This matches the method resolution order
+    # of MicroPython, but not CPython.
+    mro_pruned = []
+    for i in range(len(mro_list)):
+        base = mro_list.pop(0)
+        if base not in mro_list:
+            mro_pruned.append(base)
+    return mro_pruned
+
+
+class MultiDict(dict):
+    """A subclass of dictionary that can hold multiple values for the same
+    key. It is used to hold key/value pairs decoded from query strings and
+    form submissions.
+
+    :param initial_dict: an initial dictionary of key/value pairs to
+                         initialize this object with.
+
+    Example::
+
+        >>> d = MultiDict()
+        >>> d['sort'] = 'name'
+        >>> d['sort'] = 'email'
+        >>> print(d['sort'])
+        'name'
+        >>> print(d.getlist('sort'))
+        ['name', 'email']
+    """
+    def __init__(self, initial_dict=None):
+        super().__init__()
+        if initial_dict:
+            for key, value in initial_dict.items():
+                self[key] = value
+
+    def __setitem__(self, key, value):
+        if key not in self:
+            super().__setitem__(key, [])
+        super().__getitem__(key).append(value)
+
+    def __getitem__(self, key):
+        return super().__getitem__(key)[0]
+
+    def get(self, key, default=None, type=None):
+        """Return the value for a given key.
+
+        :param key: The key to retrieve.
+        :param default: A default value to use if the key does not exist.
+        :param type: A type conversion callable to apply to the value.
+
+        If the multidict contains more than one value for the requested key,
+        this method returns the first value only.
+
+        Example::
+
+            >>> d = MultiDict()
+            >>> d['age'] = '42'
+            >>> d.get('age')
+            '42'
+            >>> d.get('age', type=int)
+            42
+            >>> d.get('name', default='noname')
+            'noname'
+        """
+        if key not in self:
+            return default
+        value = self[key]
+        if type is not None:
+            value = type(value)
+        return value
+
+    def getlist(self, key, type=None):
+        """Return all the values for a given key.
+
+        :param key: The key to retrieve.
+        :param type: A type conversion callable to apply to the values.
+
+        If the requested key does not exist in the dictionary, this method
+        returns an empty list.
+
+        Example::
+
+            >>> d = MultiDict()
+            >>> d.getlist('items')
+            []
+            >>> d['items'] = '3'
+            >>> d.getlist('items')
+            ['3']
+            >>> d['items'] = '56'
+            >>> d.getlist('items')
+            ['3', '56']
+            >>> d.getlist('items', type=int)
+            [3, 56]
+        """
+        if key not in self:
+            return []
+        values = super().__getitem__(key)
+        if type is not None:
+            values = [type(value) for value in values]
+        return values
+
+
+class AsyncBytesIO:
+    """An async wrapper for BytesIO."""
+    def __init__(self, data):
+        self.stream = io.BytesIO(data)
+
+    async def read(self, n=-1):
+        return self.stream.read(n)
+
+    async def readline(self):  # pragma: no cover
+        return self.stream.readline()
+
+    async def readexactly(self, n):  # pragma: no cover
+        return self.stream.read(n)
+
+    async def readuntil(self, separator=b'\n'):  # pragma: no cover
+        return self.stream.readuntil(separator=separator)
+
+    async def awrite(self, data):  # pragma: no cover
+        return self.stream.write(data)
+
+    async def aclose(self):  # pragma: no cover
+        pass
+
+
+class Request:
+    """An HTTP request."""
+    #: Specify the maximum payload size that is accepted. Requests with larger
+    #: payloads will be rejected with a 413 status code. Applications can
+    #: change this maximum as necessary.
+    #:
+    #: Example::
+    #:
+    #:    Request.max_content_length = 1 * 1024 * 1024  # 1MB requests allowed
+    max_content_length = 16 * 1024
+
+    #: Specify the maximum payload size that can be stored in ``body``.
+    #: Requests with payloads that are larger than this size and up to
+    #: ``max_content_length`` bytes will be accepted, but the application will
+    #: only be able to access the body of the request by reading from
+    #: ``stream``. Set to 0 if you always access the body as a stream.
+    #:
+    #: Example::
+    #:
+    #:    Request.max_body_length = 4 * 1024  # up to 4KB bodies read
+    max_body_length = 16 * 1024
+
+    #: Specify the maximum length allowed for a line in the request. Requests
+    #: with longer lines will not be correctly interpreted. Applications can
+    #: change this maximum as necessary.
+    #:
+    #: Example::
+    #:
+    #:    Request.max_readline = 16 * 1024  # 16KB lines allowed
+    max_readline = 2 * 1024
+
+    class G:
+        pass
+
+    def __init__(self, app, client_addr, method, url, http_version, headers,
+                 body=None, stream=None, sock=None, url_prefix='',
+                 subapp=None):
+        #: The application instance to which this request belongs.
+        self.app = app
+        #: The address of the client, as a tuple (host, port).
+        self.client_addr = client_addr
+        #: The HTTP method of the request.
+        self.method = method
+        #: The request URL, including the path and query string.
+        self.url = url
+        #: The URL prefix, if the endpoint comes from a mounted
+        #: sub-application, or else ''.
+        self.url_prefix = url_prefix
+        #: The sub-application instance, or `None` if this isn't a mounted
+        #: endpoint.
+        self.subapp = subapp
+        #: The path portion of the URL.
+        self.path = url
+        #: The query string portion of the URL.
+        self.query_string = None
+        #: The parsed query string, as a
+        #: :class:`MultiDict <microdot.MultiDict>` object.
+        self.args = {}
+        #: A dictionary with the headers included in the request.
+        self.headers = headers
+        #: A dictionary with the cookies included in the request.
+        self.cookies = {}
+        #: The parsed ``Content-Length`` header.
+        self.content_length = 0
+        #: The parsed ``Content-Type`` header.
+        self.content_type = None
+        #: A general purpose container for applications to store data during
+        #: the life of the request.
+        self.g = Request.G()
+
+        self.http_version = http_version
+        if '?' in self.path:
+            self.path, self.query_string = self.path.split('?', 1)
+            self.args = self._parse_urlencoded(self.query_string)
+
+        if 'Content-Length' in self.headers:
+            self.content_length = int(self.headers['Content-Length'])
+        if 'Content-Type' in self.headers:
+            self.content_type = self.headers['Content-Type']
+        if 'Cookie' in self.headers:
+            for cookie in self.headers['Cookie'].split(';'):
+                name, value = cookie.strip().split('=', 1)
+                self.cookies[name] = value
+
+        self._body = body
+        self.body_used = False
+        self._stream = stream
+        self.sock = sock
+        self._json = None
+        self._form = None
+        self._files = None
+        self.after_request_handlers = []
+
+    @staticmethod
+    async def create(app, client_reader, client_writer, client_addr):
+        """Create a request object.
+
+        :param app: The Microdot application instance.
+        :param client_reader: An input stream from where the request data can
+                              be read.
+        :param client_writer: An output stream where the response data can be
+                              written.
+        :param client_addr: The address of the client, as a tuple.
+
+        This method is a coroutine. It returns a newly created ``Request``
+        object.
+        """
+        # request line
+        line = (await Request._safe_readline(client_reader)).strip().decode()
+        if not line:  # pragma: no cover
+            return None
+        method, url, http_version = line.split()
+        http_version = http_version.split('/', 1)[1]
+
+        # headers
+        headers = NoCaseDict()
+        content_length = 0
+        while True:
+            line = (await Request._safe_readline(
+                client_reader)).strip().decode()
+            if line == '':
+                break
+            header, value = line.split(':', 1)
+            value = value.strip()
+            headers[header] = value
+            if header.lower() == 'content-length':
+                content_length = int(value)
+
+        # body
+        body = b''
+        if content_length and content_length <= Request.max_body_length:
+            body = await client_reader.readexactly(content_length)
+            stream = None
+        else:
+            body = b''
+            stream = client_reader
+
+        return Request(app, client_addr, method, url, http_version, headers,
+                       body=body, stream=stream,
+                       sock=(client_reader, client_writer))
+
+    def _parse_urlencoded(self, urlencoded):
+        data = MultiDict()
+        if len(urlencoded) > 0:  # pragma: no branch
+            if isinstance(urlencoded, str):
+                for kv in [pair.split('=', 1)
+                           for pair in urlencoded.split('&') if pair]:
+                    data[urldecode(kv[0])] = urldecode(kv[1]) \
+                        if len(kv) > 1 else ''
+            elif isinstance(urlencoded, bytes):  # pragma: no branch
+                for kv in [pair.split(b'=', 1)
+                           for pair in urlencoded.split(b'&') if pair]:
+                    data[urldecode(kv[0])] = urldecode(kv[1]) \
+                        if len(kv) > 1 else b''
+        return data
+
+    @property
+    def body(self):
+        """The body of the request, as bytes."""
+        return self._body
+
+    @property
+    def stream(self):
+        """The body of the request, as a bytes stream."""
+        if self._stream is None:
+            self._stream = AsyncBytesIO(self._body)
+        return self._stream
+
+    @property
+    def json(self):
+        """The parsed JSON body, or ``None`` if the request does not have a
+        JSON body."""
+        if self._json is None:
+            if self.content_type is None:
+                return None
+            mime_type = self.content_type.split(';')[0]
+            if mime_type != 'application/json':
+                return None
+            self._json = json.loads(self.body.decode())
+        return self._json
+
+    @property
+    def form(self):
+        """The parsed form submission body, as a
+        :class:`MultiDict <microdot.MultiDict>` object, or ``None`` if the
+        request does not have a form submission.
+
+        Forms that are URL encoded are processed by default. For multipart
+        forms to be processed, the
+        :func:`with_form_data <microdot.multipart.with_form_data>`
+        decorator must be added to the route.
+        """
+        if self._form is None:
+            if self.content_type is None:
+                return None
+            mime_type = self.content_type.split(';')[0]
+            if mime_type != 'application/x-www-form-urlencoded':
+                return None
+            self._form = self._parse_urlencoded(self.body)
+        return self._form
+
+    @property
+    def files(self):
+        """The files uploaded in the request as a dictionary, or ``None`` if
+        the request does not have any files.
+
+        The :func:`with_form_data <microdot.multipart.with_form_data>`
+        decorator must be added to the route that receives file uploads for
+        this property to be set.
+        """
+        return self._files
+
+    def after_request(self, f):
+        """Register a request-specific function to run after the request is
+        handled. Request-specific after request handlers run at the very end,
+        after the application's own after request handlers. The function must
+        take two arguments, the request and response objects. The return value
+        of the function must be the updated response object.
+
+        Example::
+
+            @app.route('/')
+            def index(request):
+                # register a request-specific after request handler
+                @req.after_request
+                def func(request, response):
+                    # ...
+                    return response
+
+                return 'Hello, World!'
+
+        Note that the function is not called if the request handler raises an
+        exception and an error response is returned instead.
+        """
+        self.after_request_handlers.append(f)
+        return f
+
+    @staticmethod
+    async def _safe_readline(stream):
+        line = (await stream.readline())
+        if len(line) > Request.max_readline:
+            raise ValueError('line too long')
+        return line
+
+
+class Response:
+    """An HTTP response class.
+
+    :param body: The body of the response. If a dictionary or list is given,
+                 a JSON formatter is used to generate the body. If a file-like
+                 object or an async generator is given, a streaming response is
+                 used. If a string is given, it is encoded from UTF-8. Else,
+                 the body should be a byte sequence.
+    :param status_code: The numeric HTTP status code of the response. The
+                        default is 200.
+    :param headers: A dictionary of headers to include in the response.
+    :param reason: A custom reason phrase to add after the status code. The
+                   default is "OK" for responses with a 200 status code and
+                   "N/A" for any other status codes.
+    """
+    types_map = {
+        'css': 'text/css',
+        'gif': 'image/gif',
+        'html': 'text/html',
+        'jpg': 'image/jpeg',
+        'js': 'application/javascript',
+        'json': 'application/json',
+        'png': 'image/png',
+        'txt': 'text/plain',
+        'svg': 'image/svg+xml',
+    }
+
+    send_file_buffer_size = 1024
+
+    #: The content type to use for responses that do not explicitly define a
+    #: ``Content-Type`` header.
+    default_content_type = 'text/plain'
+
+    #: The default cache control max age used by :meth:`send_file`. A value
+    #: of ``None`` means that no ``Cache-Control`` header is added.
+    default_send_file_max_age = None
+
+    #: Special response used to signal that a response does not need to be
+    #: written to the client. Used to exit WebSocket connections cleanly.
+    already_handled = None
+
+    def __init__(self, body='', status_code=200, headers=None, reason=None):
+        if body is None and status_code == 200:
+            body = ''
+            status_code = 204
+        self.status_code = status_code
+        self.headers = NoCaseDict(headers or {})
+        self.reason = reason
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body)
+            self.headers['Content-Type'] = 'application/json; charset=UTF-8'
+        if isinstance(body, str):
+            self.body = body.encode()
+        else:
+            # this applies to bytes, file-like objects or generators
+            self.body = body
+        self.is_head = False
+
+    def set_cookie(self, cookie, value, path=None, domain=None, expires=None,
+                   max_age=None, secure=False, http_only=False,
+                   partitioned=False):
+        """Add a cookie to the response.
+
+        :param cookie: The cookie's name.
+        :param value: The cookie's value.
+        :param path: The cookie's path.
+        :param domain: The cookie's domain.
+        :param expires: The cookie expiration time, as a ``datetime`` object
+                        or a correctly formatted string.
+        :param max_age: The cookie's ``Max-Age`` value.
+        :param secure: The cookie's ``secure`` flag.
+        :param http_only: The cookie's ``HttpOnly`` flag.
+        :param partitioned: Whether the cookie is partitioned.
+        """
+        http_cookie = '{cookie}={value}'.format(cookie=cookie, value=value)
+        if path:
+            http_cookie += '; Path=' + path
+        if domain:
+            http_cookie += '; Domain=' + domain
+        if expires:
+            if isinstance(expires, str):
+                http_cookie += '; Expires=' + expires
+            else:  # pragma: no cover
+                http_cookie += '; Expires=' + time.strftime(
+                    '%a, %d %b %Y %H:%M:%S GMT', expires.timetuple())
+        if max_age is not None:
+            http_cookie += '; Max-Age=' + str(max_age)
+        if secure:
+            http_cookie += '; Secure'
+        if http_only:
+            http_cookie += '; HttpOnly'
+        if partitioned:
+            http_cookie += '; Partitioned'
+        if 'Set-Cookie' in self.headers:
+            self.headers['Set-Cookie'].append(http_cookie)
+        else:
+            self.headers['Set-Cookie'] = [http_cookie]
+
+    def delete_cookie(self, cookie, **kwargs):
+        """Delete a cookie.
+
+        :param cookie: The cookie's name.
+        :param kwargs: Any cookie opens and flags supported by
+                       ``set_cookie()`` except ``expires`` and ``max_age``.
+        """
+        self.set_cookie(cookie, '', expires='Thu, 01 Jan 1970 00:00:01 GMT',
+                        max_age=0, **kwargs)
+
+    def complete(self):
+        if isinstance(self.body, bytes) and \
+                'Content-Length' not in self.headers:
+            self.headers['Content-Length'] = str(len(self.body))
+        if 'Content-Type' not in self.headers:
+            self.headers['Content-Type'] = self.default_content_type
+            if 'charset=' not in self.headers['Content-Type']:
+                self.headers['Content-Type'] += '; charset=UTF-8'
+
+    async def write(self, stream):
+        self.complete()
+
+        try:
+            # status code
+            reason = self.reason if self.reason is not None else \
+                ('OK' if self.status_code == 200 else 'N/A')
+            await stream.awrite('HTTP/1.0 {status_code} {reason}\r\n'.format(
+                status_code=self.status_code, reason=reason).encode())
+
+            # headers
+            for header, value in self.headers.items():
+                values = value if isinstance(value, list) else [value]
+                for value in values:
+                    await stream.awrite('{header}: {value}\r\n'.format(
+                        header=header, value=value).encode())
+            await stream.awrite(b'\r\n')
+
+            # body
+            if not self.is_head:
+                iter = self.body_iter()
+                async for body in iter:
+                    if isinstance(body, str):  # pragma: no cover
+                        body = body.encode()
+                    try:
+                        await stream.awrite(body)
+                    except OSError as exc:  # pragma: no cover
+                        if exc.errno in MUTED_SOCKET_ERRORS or \
+                                exc.args[0] == 'Connection lost':
+                            if hasattr(iter, 'aclose'):
+                                await iter.aclose()
+                        raise
+                if hasattr(iter, 'aclose'):  # pragma: no branch
+                    await iter.aclose()
+
+        except OSError as exc:  # pragma: no cover
+            if exc.errno in MUTED_SOCKET_ERRORS or \
+                    exc.args[0] == 'Connection lost':
+                pass
+            else:
+                raise
+
+    def body_iter(self):
+        if hasattr(self.body, '__anext__'):
+            # response body is an async generator
+            return self.body
+
+        response = self
+
+        class iter:
+            ITER_UNKNOWN = 0
+            ITER_SYNC_GEN = 1
+            ITER_FILE_OBJ = 2
+            ITER_NO_BODY = -1
+
+            def __aiter__(self):
+                if response.body:
+                    self.i = self.ITER_UNKNOWN  # need to determine type
+                else:
+                    self.i = self.ITER_NO_BODY
+                return self
+
+            async def __anext__(self):
+                if self.i == self.ITER_NO_BODY:
+                    await self.aclose()
+                    raise StopAsyncIteration
+                if self.i == self.ITER_UNKNOWN:
+                    if hasattr(response.body, 'read'):
+                        self.i = self.ITER_FILE_OBJ
+                    elif hasattr(response.body, '__next__'):
+                        self.i = self.ITER_SYNC_GEN
+                        return next(response.body)
+                    else:
+                        self.i = self.ITER_NO_BODY
+                        return response.body
+                elif self.i == self.ITER_SYNC_GEN:
+                    try:
+                        return next(response.body)
+                    except StopIteration:
+                        await self.aclose()
+                        raise StopAsyncIteration
+                buf = response.body.read(response.send_file_buffer_size)
+                if iscoroutine(buf):  # pragma: no cover
+                    buf = await buf
+                if len(buf) < response.send_file_buffer_size:
+                    self.i = self.ITER_NO_BODY
+                return buf
+
+            async def aclose(self):
+                if hasattr(response.body, 'close'):
+                    result = response.body.close()
+                    if iscoroutine(result):  # pragma: no cover
+                        await result
+
+        return iter()
+
+    @classmethod
+    def redirect(cls, location, status_code=302):
+        """Return a redirect response.
+
+        :param location: The URL to redirect to.
+        :param status_code: The 3xx status code to use for the redirect. The
+                            default is 302.
+        """
+        if '\x0d' in location or '\x0a' in location:
+            raise ValueError('invalid redirect URL')
+        return cls(status_code=status_code, headers={'Location': location})
+
+    @classmethod
+    def send_file(cls, filename, status_code=200, content_type=None,
+                  stream=None, max_age=None, compressed=False,
+                  file_extension=''):
+        """Send file contents in a response.
+
+        :param filename: The filename of the file.
+        :param status_code: The 3xx status code to use for the redirect. The
+                            default is 302.
+        :param content_type: The ``Content-Type`` header to use in the
+                             response. If omitted, it is generated
+                             automatically from the file extension of the
+                             ``filename`` parameter.
+        :param stream: A file-like object to read the file contents from. If
+                       a stream is given, the ``filename`` parameter is only
+                       used when generating the ``Content-Type`` header.
+        :param max_age: The ``Cache-Control`` header's ``max-age`` value in
+                        seconds. If omitted, the value of the
+                        :attr:`Response.default_send_file_max_age` attribute is
+                        used.
+        :param compressed: Whether the file is compressed. If ``True``, the
+                           ``Content-Encoding`` header is set to ``gzip``. A
+                           string with the header value can also be passed.
+                           Note that when using this option the file must have
+                           been compressed beforehand. This option only sets
+                           the header.
+        :param file_extension: A file extension to append to the ``filename``
+                               parameter when opening the file, including the
+                               dot. The extension given here is not considered
+                               when generating the ``Content-Type`` header.
+
+        Security note: The filename is assumed to be trusted. Never pass
+        filenames provided by the user without validating and sanitizing them
+        first.
+        """
+        if content_type is None:
+            if compressed and filename.endswith('.gz'):
+                ext = filename[:-3].split('.')[-1]
+            else:
+                ext = filename.split('.')[-1]
+            if ext in Response.types_map:
+                content_type = Response.types_map[ext]
+            else:
+                content_type = 'application/octet-stream'
+        headers = {'Content-Type': content_type}
+
+        if max_age is None:
+            max_age = cls.default_send_file_max_age
+        if max_age is not None:
+            headers['Cache-Control'] = 'max-age={}'.format(max_age)
+
+        if compressed:
+            headers['Content-Encoding'] = compressed \
+                if isinstance(compressed, str) else 'gzip'
+
+        f = stream or open(filename + file_extension, 'rb')
+        return cls(body=f, status_code=status_code, headers=headers)
+
+
+class URLPattern():
+    """A class that represents the URL pattern for a route.
+
+    :param url_pattern: The route URL pattern, which can include static and
+                        dynamic path segments. Dynamic segments are enclosed in
+                        ``<`` and ``>``. The type of the segment can be given
+                        as a prefix, separated from the name with a colon.
+                        Supported types are ``string`` (the default),
+                        ``int`` and ``path``. Custom types can be registered
+                        using the :meth:`URLPattern.register_type` method.
+    """
+
+    segment_patterns = {
+        'string': '/([^/]+)',
+        'int': '/(-?\\d+)',
+        'path': '/(.+)',
+    }
+    segment_parsers = {
+        'int': lambda value: int(value),
+    }
+
+    @classmethod
+    def register_type(cls, type_name, pattern='[^/]+', parser=None):
+        """Register a new URL segment type.
+
+        :param type_name: The name of the segment type to register.
+        :param pattern: The regular expression pattern to use when matching
+                        this segment type. If not given, a default matcher for
+                        a single path segment is used.
+        :param parser: A callable that will be used to parse and transform the
+                       value of the segment. If omitted, the value is returned
+                       as a string.
+        """
+        cls.segment_patterns[type_name] = '/({})'.format(pattern)
+        cls.segment_parsers[type_name] = parser
+
+    def __init__(self, url_pattern):
+        self.url_pattern = url_pattern
+        self.segments = []
+        self.regex = None
+
+    def compile(self):
+        """Generate a regular expression for the URL pattern.
+
+        This method is automatically invoked the first time the URL pattern is
+        matched against a path.
+        """
+        pattern = ''
+        for segment in self.url_pattern.lstrip('/').split('/'):
+            if segment and segment[0] == '<':
+                if segment[-1] != '>':
+                    raise ValueError('invalid URL pattern')
+                segment = segment[1:-1]
+                if ':' in segment:
+                    type_, name = segment.rsplit(':', 1)
+                else:
+                    type_ = 'string'
+                    name = segment
+                parser = None
+                if type_.startswith('re:'):
+                    pattern += '/({pattern})'.format(pattern=type_[3:])
+                else:
+                    if type_ not in self.segment_patterns:
+                        raise ValueError('invalid URL segment type')
+                    pattern += self.segment_patterns[type_]
+                    parser = self.segment_parsers.get(type_)
+                self.segments.append({'parser': parser, 'name': name,
+                                      'type': type_})
+            else:
+                pattern += '/' + segment
+                self.segments.append({'parser': None})
+        self.regex = re.compile('^' + pattern + '$')
+        return self.regex
+
+    def match(self, path):
+        """Match a path against the URL pattern.
+
+        Returns a dictionary with the values of all dynamic path segments if a
+        matche is found, or ``None`` if the path does not match this pattern.
+        """
+        args = {}
+        g = (self.regex or self.compile()).match(path)
+        if not g:
+            return
+        i = 1
+        for segment in self.segments:
+            if 'name' not in segment:
+                continue
+            arg = g.group(i)
+            if segment['parser']:
+                arg = self.segment_parsers[segment['type']](arg)
+                if arg is None:
+                    return
+            args[segment['name']] = arg
+            i += 1
+        return args
+
+    def __repr__(self):  # pragma: no cover
+        return 'URLPattern: {}'.format(self.url_pattern)
+
+
+class HTTPException(Exception):
+    def __init__(self, status_code, reason=None):
+        self.status_code = status_code
+        self.reason = reason or str(status_code) + ' error'
+
+    def __repr__(self):  # pragma: no cover
+        return 'HTTPException: {}'.format(self.status_code)
+
+
+class Microdot:
+    """An HTTP application class.
+
+    This class implements an HTTP application instance and is heavily
+    influenced by the ``Flask`` class of the Flask framework. It is typically
+    declared near the start of the main application script.
+
+    Example::
+
+        from microdot import Microdot
+
+        app = Microdot()
+    """
+
+    def __init__(self):
+        self.url_map = []
+        self.before_request_handlers = []
+        self.after_request_handlers = []
+        self.after_error_request_handlers = []
+        self.error_handlers = {}
+        self.shutdown_requested = False
+        self.options_handler = self.default_options_handler
+        self.debug = False
+        self.server = None
+
+    def route(self, url_pattern, methods=None):
+        """Decorator that is used to register a function as a request handler
+        for a given URL.
+
+        :param url_pattern: The URL pattern that will be compared against
+                            incoming requests.
+        :param methods: The list of HTTP methods to be handled by the
+                        decorated function. If omitted, only ``GET`` requests
+                        are handled.
+
+        The URL pattern can be a static path (for example, ``/users`` or
+        ``/api/invoices/search``) or a path with dynamic components enclosed
+        in ``<`` and ``>`` (for example, ``/users/<id>`` or
+        ``/invoices/<number>/products``). Dynamic path components can also
+        include a type prefix, separated from the name with a colon (for
+        example, ``/users/<int:id>``). The type can be ``string`` (the
+        default), ``int``, ``path`` or ``re:[regular-expression]``.
+
+        The first argument of the decorated function must be
+        the request object. Any path arguments that are specified in the URL
+        pattern are passed as keyword arguments. The return value of the
+        function must be a :class:`Response` instance, or the arguments to
+        be passed to this class.
+
+        Example::
+
+            @app.route('/')
+            def index(request):
+                return 'Hello, world!'
+        """
+        def decorated(f):
+            self.url_map.append(
+                ([m.upper() for m in (methods or ['GET'])],
+                 URLPattern(url_pattern), f, '', None))
+            return f
+        return decorated
+
+    def get(self, url_pattern):
+        """Decorator that is used to register a function as a ``GET`` request
+        handler for a given URL.
+
+        :param url_pattern: The URL pattern that will be compared against
+                            incoming requests.
+
+        This decorator can be used as an alias to the ``route`` decorator with
+        ``methods=['GET']``.
+
+        Example::
+
+            @app.get('/users/<int:id>')
+            def get_user(request, id):
+                # ...
+        """
+        return self.route(url_pattern, methods=['GET'])
+
+    def post(self, url_pattern):
+        """Decorator that is used to register a function as a ``POST`` request
+        handler for a given URL.
+
+        :param url_pattern: The URL pattern that will be compared against
+                            incoming requests.
+
+        This decorator can be used as an alias to the``route`` decorator with
+        ``methods=['POST']``.
+
+        Example::
+
+            @app.post('/users')
+            def create_user(request):
+                # ...
+        """
+        return self.route(url_pattern, methods=['POST'])
+
+    def put(self, url_pattern):
+        """Decorator that is used to register a function as a ``PUT`` request
+        handler for a given URL.
+
+        :param url_pattern: The URL pattern that will be compared against
+                            incoming requests.
+
+        This decorator can be used as an alias to the ``route`` decorator with
+        ``methods=['PUT']``.
+
+        Example::
+
+            @app.put('/users/<int:id>')
+            def edit_user(request, id):
+                # ...
+        """
+        return self.route(url_pattern, methods=['PUT'])
+
+    def patch(self, url_pattern):
+        """Decorator that is used to register a function as a ``PATCH`` request
+        handler for a given URL.
+
+        :param url_pattern: The URL pattern that will be compared against
+                            incoming requests.
+
+        This decorator can be used as an alias to the ``route`` decorator with
+        ``methods=['PATCH']``.
+
+        Example::
+
+            @app.patch('/users/<int:id>')
+            def edit_user(request, id):
+                # ...
+        """
+        return self.route(url_pattern, methods=['PATCH'])
+
+    def delete(self, url_pattern):
+        """Decorator that is used to register a function as a ``DELETE``
+        request handler for a given URL.
+
+        :param url_pattern: The URL pattern that will be compared against
+                            incoming requests.
+
+        This decorator can be used as an alias to the ``route`` decorator with
+        ``methods=['DELETE']``.
+
+        Example::
+
+            @app.delete('/users/<int:id>')
+            def delete_user(request, id):
+                # ...
+        """
+        return self.route(url_pattern, methods=['DELETE'])
+
+    def before_request(self, f):
+        """Decorator to register a function to run before each request is
+        handled. The decorated function must take a single argument, the
+        request object.
+
+        Example::
+
+            @app.before_request
+            def func(request):
+                # ...
+        """
+        self.before_request_handlers.append(f)
+        return f
+
+    def after_request(self, f):
+        """Decorator to register a function to run after each request is
+        handled. The decorated function must take two arguments, the request
+        and response objects. The return value of the function must be an
+        updated response object.
+
+        Example::
+
+            @app.after_request
+            def func(request, response):
+                # ...
+                return response
+        """
+        self.after_request_handlers.append(f)
+        return f
+
+    def after_error_request(self, f):
+        """Decorator to register a function to run after an error response is
+        generated. The decorated function must take two arguments, the request
+        and response objects. The return value of the function must be an
+        updated response object. The handler is invoked for error responses
+        generated by Microdot, as well as those returned by application-defined
+        error handlers.
+
+        Example::
+
+            @app.after_error_request
+            def func(request, response):
+                # ...
+                return response
+        """
+        self.after_error_request_handlers.append(f)
+        return f
+
+    def errorhandler(self, status_code_or_exception_class):
+        """Decorator to register a function as an error handler. Error handler
+        functions for numeric HTTP status codes must accept a single argument,
+        the request object. Error handler functions for Python exceptions
+        must accept two arguments, the request object and the exception
+        object.
+
+        :param status_code_or_exception_class: The numeric HTTP status code or
+                                               Python exception class to
+                                               handle.
+
+        Examples::
+
+            @app.errorhandler(404)
+            def not_found(request):
+                return 'Not found'
+
+            @app.errorhandler(RuntimeError)
+            def runtime_error(request, exception):
+                return 'Runtime error'
+        """
+        def decorated(f):
+            self.error_handlers[status_code_or_exception_class] = f
+            return f
+        return decorated
+
+    def mount(self, subapp, url_prefix='', local=False):
+        """Mount a sub-application, optionally under the given URL prefix.
+
+        :param subapp: The sub-application to mount.
+        :param url_prefix: The URL prefix to mount the application under.
+        :param local: When set to ``True``, the before, after and error request
+                      handlers only apply to endpoints defined in the
+                      sub-application. When ``False``, they apply to the entire
+                      application. The default is ``False``.
+        """
+        for methods, pattern, handler, _prefix, _subapp in subapp.url_map:
+            self.url_map.append(
+                (methods, URLPattern(url_prefix + pattern.url_pattern),
+                 handler, url_prefix + _prefix, _subapp or subapp))
+        if not local:
+            for handler in subapp.before_request_handlers:
+                self.before_request_handlers.append(handler)
+            subapp.before_request_handlers = []
+            for handler in subapp.after_request_handlers:
+                self.after_request_handlers.append(handler)
+            subapp.after_request_handlers = []
+            for handler in subapp.after_error_request_handlers:
+                self.after_error_request_handlers.append(handler)
+            subapp.after_error_request_handlers = []
+            for status_code, handler in subapp.error_handlers.items():
+                self.error_handlers[status_code] = handler
+            subapp.error_handlers = {}
+
+    @staticmethod
+    def abort(status_code, reason=None):
+        """Abort the current request and return an error response with the
+        given status code.
+
+        :param status_code: The numeric status code of the response.
+        :param reason: The reason for the response, which is included in the
+                       response body.
+
+        Example::
+
+            from microdot import abort
+
+            @app.route('/users/<int:id>')
+            def get_user(id):
+                user = get_user_by_id(id)
+                if user is None:
+                    abort(404)
+                return user.to_dict()
+        """
+        raise HTTPException(status_code, reason)
+
+    async def start_server(self, host='0.0.0.0', port=5000, debug=False,
+                           ssl=None):
+        """Start the Microdot web server as a coroutine. This coroutine does
+        not normally return, as the server enters an endless listening loop.
+        The :func:`shutdown` function provides a method for terminating the
+        server gracefully.
+
+        :param host: The hostname or IP address of the network interface that
+                     will be listening for requests. A value of ``'0.0.0.0'``
+                     (the default) indicates that the server should listen for
+                     requests on all the available interfaces, and a value of
+                     ``127.0.0.1`` indicates that the server should listen
+                     for requests only on the internal networking interface of
+                     the host.
+        :param port: The port number to listen for requests. The default is
+                     port 5000.
+        :param debug: If ``True``, the server logs debugging information. The
+                      default is ``False``.
+        :param ssl: An ``SSLContext`` instance or ``None`` if the server should
+                    not use TLS. The default is ``None``.
+
+        This method is a coroutine.
+
+        Example::
+
+            import asyncio
+            from microdot import Microdot
+
+            app = Microdot()
+
+            @app.route('/')
+            async def index(request):
+                return 'Hello, world!'
+
+            async def main():
+                await app.start_server(debug=True)
+
+            asyncio.run(main())
+        """
+        self.debug = debug
+
+        async def serve(reader, writer):
+            if not hasattr(writer, 'awrite'):  # pragma: no cover
+                # CPython provides the awrite and aclose methods in 3.8+
+                async def awrite(self, data):
+                    self.write(data)
+                    await self.drain()
+
+                async def aclose(self):
+                    self.close()
+                    await self.wait_closed()
+
+                from types import MethodType
+                writer.awrite = MethodType(awrite, writer)
+                writer.aclose = MethodType(aclose, writer)
+
+            await self.handle_request(reader, writer)
+
+        if self.debug:  # pragma: no cover
+            print('Starting async server on {host}:{port}...'.format(
+                host=host, port=port))
+
+        try:
+            self.server = await asyncio.start_server(serve, host, port,
+                                                     ssl=ssl)
+        except TypeError:  # pragma: no cover
+            self.server = await asyncio.start_server(serve, host, port)
+
+        while True:
+            try:
+                if hasattr(self.server, 'serve_forever'):  # pragma: no cover
+                    try:
+                        await self.server.serve_forever()
+                    except asyncio.CancelledError:
+                        pass
+                await self.server.wait_closed()
+                break
+            except AttributeError:  # pragma: no cover
+                # the task hasn't been initialized in the server object yet
+                # wait a bit and try again
+                await asyncio.sleep(0.1)
+
+    def run(self, host='0.0.0.0', port=5000, debug=False, ssl=None):
+        """Start the web server. This function does not normally return, as
+        the server enters an endless listening loop. The :func:`shutdown`
+        function provides a method for terminating the server gracefully.
+
+        :param host: The hostname or IP address of the network interface that
+                     will be listening for requests. A value of ``'0.0.0.0'``
+                     (the default) indicates that the server should listen for
+                     requests on all the available interfaces, and a value of
+                     ``127.0.0.1`` indicates that the server should listen
+                     for requests only on the internal networking interface of
+                     the host.
+        :param port: The port number to listen for requests. The default is
+                     port 5000.
+        :param debug: If ``True``, the server logs debugging information. The
+                      default is ``False``.
+        :param ssl: An ``SSLContext`` instance or ``None`` if the server should
+                    not use TLS. The default is ``None``.
+
+        Example::
+
+            from microdot import Microdot
+
+            app = Microdot()
+
+            @app.route('/')
+            async def index(request):
+                return 'Hello, world!'
+
+            app.run(debug=True)
+        """
+        asyncio.run(self.start_server(host=host, port=port, debug=debug,
+                                      ssl=ssl))  # pragma: no cover
+
+    def shutdown(self):
+        """Request a server shutdown. The server will then exit its request
+        listening loop and the :func:`run` function will return. This function
+        can be safely called from a route handler, as it only schedules the
+        server to terminate as soon as the request completes.
+
+        Example::
+
+            @app.route('/shutdown')
+            def shutdown(request):
+                request.app.shutdown()
+                return 'The server is shutting down...'
+        """
+        self.server.close()
+
+    def find_route(self, req):
+        method = req.method.upper()
+        if method == 'OPTIONS' and self.options_handler:
+            return self.options_handler(req), '', None
+        if method == 'HEAD':
+            method = 'GET'
+        f = 404
+        p = ''
+        s = None
+        for route_methods, route_pattern, route_handler, url_prefix, subapp \
+                in self.url_map:
+            req.url_args = route_pattern.match(req.path)
+            if req.url_args is not None:
+                p = url_prefix
+                s = subapp
+                if method in route_methods:
+                    f = route_handler
+                    break
+                else:
+                    f = 405
+        return f, p, s
+
+    def default_options_handler(self, req):
+        allow = []
+        for route_methods, route_pattern, _, _, _ in self.url_map:
+            if route_pattern.match(req.path) is not None:
+                allow.extend(route_methods)
+        if 'GET' in allow:
+            allow.append('HEAD')
+        allow.append('OPTIONS')
+        return {'Allow': ', '.join(allow)}
+
+    async def handle_request(self, reader, writer):
+        req = None
+        try:
+            req = await Request.create(self, reader, writer,
+                                       writer.get_extra_info('peername'))
+        except Exception as exc:  # pragma: no cover
+            print_exception(exc)
+
+        res = await self.dispatch_request(req)
+        try:
+            if res != Response.already_handled:  # pragma: no branch
+                await res.write(writer)
+            await writer.aclose()
+        except OSError as exc:  # pragma: no cover
+            if exc.errno in MUTED_SOCKET_ERRORS:
+                pass
+            else:
+                raise
+        if self.debug and req:  # pragma: no cover
+            print('{method} {path} {status_code}'.format(
+                method=req.method, path=req.path,
+                status_code=res.status_code))
+
+    def get_request_handlers(self, req, attr, local_first=True):
+        handlers = getattr(self, attr + '_handlers')
+        local_handlers = getattr(req.subapp, attr + '_handlers') \
+            if req and req.subapp else []
+        return local_handlers + handlers if local_first \
+            else handlers + local_handlers
+
+    async def error_response(self, req, status_code, reason=None):
+        if req and req.subapp and status_code in req.subapp.error_handlers:
+            return await invoke_handler(
+                req.subapp.error_handlers[status_code], req)
+        elif status_code in self.error_handlers:
+            return await invoke_handler(self.error_handlers[status_code], req)
+        return reason or 'N/A', status_code
+
+    async def dispatch_request(self, req):
+        after_request_handled = False
+        if req:
+            if req.content_length > req.max_content_length:
+                # the request body is larger than allowed
+                res = await self.error_response(req, 413, 'Payload too large')
+            else:
+                # find the route in the app's URL map
+                f, req.url_prefix, req.subapp = self.find_route(req)
+
+                try:
+                    res = None
+                    if callable(f):
+                        # invoke the before request handlers
+                        for handler in self.get_request_handlers(
+                                req, 'before_request', False):
+                            res = await invoke_handler(handler, req)
+                            if res:
+                                break
+
+                        # invoke the endpoint handler
+                        if res is None:
+                            res = await invoke_handler(f, req, **req.url_args)
+
+                        # process the response
+                        if isinstance(res, int):
+                            # an integer response is taken as a status code
+                            # with an empty body
+                            res = '', res
+                        if isinstance(res, tuple):
+                            # handle a tuple response
+                            if isinstance(res[0], int):
+                                # a tuple that starts with an int has an empty
+                                # body
+                                res = ('', res[0],
+                                       res[1] if len(res) > 1 else {})
+                            body = res[0]
+                            if isinstance(res[1], int):
+                                # extract the status code and headers (if
+                                # available)
+                                status_code = res[1]
+                                headers = res[2] if len(res) > 2 else {}
+                            else:
+                                # if the status code is missing, assume 200
+                                status_code = 200
+                                headers = res[1]
+                            res = Response(body, status_code, headers)
+                        elif not isinstance(res, Response):
+                            # any other response types are wrapped in a
+                            # Response object
+                            res = Response(res)
+
+                        # invoke the after request handlers
+                        for handler in self.get_request_handlers(
+                                req, 'after_request', True):
+                            res = await invoke_handler(
+                                handler, req, res) or res
+                        for handler in req.after_request_handlers:
+                            res = await invoke_handler(
+                                handler, req, res) or res
+                        after_request_handled = True
+                    elif isinstance(f, dict):
+                        # the response from an OPTIONS request is a dict with
+                        # headers
+                        res = Response(headers=f)
+                    else:
+                        # if the route is not found, return a 404 or 405
+                        # response as appropriate
+                        res = await self.error_response(req, f, 'Not found')
+                except HTTPException as exc:
+                    # an HTTP exception was raised while handling this request
+                    res = await self.error_response(req, exc.status_code,
+                                                    exc.reason)
+                except Exception as exc:
+                    # an unexpected exception was raised while handling this
+                    # request
+                    print_exception(exc)
+
+                    # invoke the error handler for the exception class if one
+                    # exists
+                    handler = None
+                    res = None
+                    if req.subapp and exc.__class__ in \
+                            req.subapp.error_handlers:
+                        handler = req.subapp.error_handlers[exc.__class__]
+                    elif exc.__class__ in self.error_handlers:
+                        handler = self.error_handlers[exc.__class__]
+                    else:
+                        # walk up the exception class hierarchy to try to find
+                        # a handler
+                        for c in mro(exc.__class__)[1:]:
+                            if req.subapp and c in req.subapp.error_handlers:
+                                handler = req.subapp.error_handlers[c]
+                                break
+                            elif c in self.error_handlers:
+                                handler = self.error_handlers[c]
+                                break
+                    if handler:
+                        try:
+                            res = await invoke_handler(handler, req, exc)
+                        except Exception as exc2:  # pragma: no cover
+                            print_exception(exc2)
+                    if res is None:
+                        # if there is still no response, issue a 500 error
+                        res = await self.error_response(
+                            req, 500, 'Internal server error')
+        else:
+            # if the request could not be parsed, issue a 400 error
+            res = await self.error_response(req, 400, 'Bad request')
+        if isinstance(res, tuple):
+            res = Response(*res)
+        elif not isinstance(res, Response):
+            res = Response(res)
+        if not after_request_handled:
+            # if the request did not finish due to an error, invoke the after
+            # error request handler
+            for handler in self.get_request_handlers(
+                    req, 'after_error_request', True):
+                res = await invoke_handler(
+                    handler, req, res) or res
+        res.is_head = (req and req.method == 'HEAD')
+        return res
+
+
+Response.already_handled = Response()
+
+abort = Microdot.abort
+redirect = Response.redirect
+send_file = Response.send_file
+
+
+路徑/microdot/multipart.py內容如下：
+import os
+from random import choice
+from microdot import abort, iscoroutine, AsyncBytesIO
+from microdot.helpers import wraps
+
+
+class FormDataIter:
+    """Asynchronous iterator that parses a ``multipart/form-data`` body and
+    returns form fields and files as they are parsed.
+
+    :param request: the request object to parse.
+
+    Example usage::
+
+        from microdot.multipart import FormDataIter
+
+        @app.post('/upload')
+        async def upload(request):
+            async for name, value in FormDataIter(request):
+                print(name, value)
+
+    The iterator returns no values when the request has a content type other
+    than ``multipart/form-data``. For a file field, the returned value is of
+    type :class:`FileUpload`, which supports the
+    :meth:`read() <FileUpload.read>` and :meth:`save() <FileUpload.save>`
+    methods. Values for regular fields are provided as strings.
+
+    The request body is read efficiently in chunks of size
+    :attr:`buffer_size <FormDataIter.buffer_size>`. On iterations in which a
+    file field is encountered, the file must be consumed before moving on to
+    the next iteration, as the internal stream stored in ``FileUpload``
+    instances is invalidated at the end of the iteration.
+    """
+    #: The size of the buffer used to read chunks of the request body.
+    buffer_size = 256
+
+    def __init__(self, request):
+        self.request = request
+        self.buffer = None
+        try:
+            mimetype, boundary = request.content_type.rsplit('; boundary=', 1)
+        except ValueError:
+            return  # not a multipart request
+        if mimetype.split(';', 1)[0] == \
+                'multipart/form-data':  # pragma: no branch
+            self.boundary = b'--' + boundary.encode()
+            self.extra_size = len(boundary) + 4
+            self.buffer = b''
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.buffer is None:
+            raise StopAsyncIteration
+
+        # make sure we have consumed the previous entry
+        while await self._read_buffer(self.buffer_size) != b'':
+            pass
+
+        # make sure we are at a boundary
+        s = self.buffer.split(self.boundary, 1)
+        if len(s) != 2 or s[0] != b'':
+            abort(400)  # pragma: no cover
+        self.buffer = s[1]
+        if self.buffer[:2] == b'--':
+            # we have reached the end
+            raise StopAsyncIteration
+        elif self.buffer[:2] != b'\r\n':
+            abort(400)  # pragma: no cover
+        self.buffer = self.buffer[2:]
+
+        # parse the headers of this part
+        name = ''
+        filename = None
+        content_type = None
+        while True:
+            await self._fill_buffer()
+            lines = self.buffer.split(b'\r\n', 1)
+            if len(lines) != 2:
+                abort(400)  # pragma: no cover
+            line, self.buffer = lines
+            if line == b'':
+                # we reached the end of the headers
+                break
+            header, value = line.decode().split(':', 1)
+            header = header.lower()
+            value = value.strip()
+            if header == 'content-disposition':
+                parts = value.split(';')
+                if len(parts) < 2 or parts[0] != 'form-data':
+                    abort(400)  # pragma: no cover
+                for part in parts[1:]:
+                    part = part.strip()
+                    if part.startswith('name="'):
+                        name = part[6:-1]
+                    elif part.startswith('filename="'):  # pragma: no branch
+                        filename = part[10:-1]
+            elif header == 'content-type':  # pragma: no branch
+                content_type = value
+
+        if filename is None:
+            # this is a regular form field, so we read the value
+            value = b''
+            while True:
+                v = await self._read_buffer(self.buffer_size)
+                value += v
+                if len(v) < self.buffer_size:  # pragma: no branch
+                    break
+            return name, value.decode()
+        return name, FileUpload(filename, content_type, self._read_buffer)
+
+    async def _fill_buffer(self):
+        self.buffer += await self.request.stream.read(
+            self.buffer_size + self.extra_size - len(self.buffer))
+
+    async def _read_buffer(self, n=-1):
+        data = b''
+        while n == -1 or len(data) < n:
+            await self._fill_buffer()
+            s = self.buffer.split(self.boundary, 1)
+            data += s[0][:n] if n != -1 else s[0]
+            self.buffer = s[0][n:] if n != -1 else b''
+            if len(s) == 2:  # pragma: no branch
+                # the end of this part is in the buffer
+                if len(self.buffer) < 2:
+                    # we have read all the way to the end of this part
+                    data = data[:-(2 - len(self.buffer))]  # remove last "\r\n"
+                self.buffer += self.boundary + s[1]
+                return data
+        return data
+
+
+class FileUpload:
+    """Class that represents an uploaded file.
+
+    :param filename: the name of the uploaded file.
+    :param content_type: the content type of the uploaded file.
+    :param read: a coroutine that reads from the uploaded file's stream.
+
+    An uploaded file can be read from the stream using the :meth:`read()`
+    method or saved to a file using the :meth:`save()` method.
+
+    Instances of this class do not normally need to be created directly.
+    """
+    #: The size at which the file is copied to a temporary file.
+    max_memory_size = 1024
+
+    def __init__(self, filename, content_type, read):
+        self.filename = filename
+        self.content_type = content_type
+        self._read = read
+        self._close = None
+
+    async def read(self, n=-1):
+        """Read up to ``n`` bytes from the uploaded file's stream.
+
+        :param n: the maximum number of bytes to read. If ``n`` is -1 or not
+                  given, the entire file is read.
+        """
+        return await self._read(n)
+
+    async def save(self, path_or_file):
+        """Save the uploaded file to the given path or file object.
+
+        :param path_or_file: the path to save the file to, or a file object
+                             to which the file is to be written.
+
+        The file is read and written in chunks of size
+        :attr:`FormDataIter.buffer_size`.
+        """
+        if isinstance(path_or_file, str):
+            f = open(path_or_file, 'wb')
+        else:
+            f = path_or_file
+        while True:
+            data = await self.read(FormDataIter.buffer_size)
+            if not data:
+                break
+            f.write(data)
+        if f != path_or_file:
+            f.close()
+
+    async def copy(self, max_memory_size=None):
+        """Copy the uploaded file to a temporary file, to allow the parsing of
+        the multipart form to continue.
+
+        :param max_memory_size: the maximum size of the file to keep in memory.
+                                If not given, then the class attribute of the
+                                same name is used.
+        """
+        max_memory_size = max_memory_size or FileUpload.max_memory_size
+        buffer = await self.read(max_memory_size)
+        if len(buffer) < max_memory_size:
+            f = AsyncBytesIO(buffer)
+            self._read = f.read
+            return self
+
+        # create a temporary file
+        while True:
+            tmpname = "".join([
+                choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+                for _ in range(12)
+            ])
+            try:
+                f = open(tmpname, 'x+b')
+            except OSError as e:  # pragma: no cover
+                if e.errno == 17:
+                    # EEXIST
+                    continue
+                elif e.errno == 2:
+                    # ENOENT
+                    # some MicroPython platforms do not support mode "x"
+                    f = open(tmpname, 'w+b')
+                    if f.read(1) != b'':
+                        f.close()
+                        continue
+                else:
+                    raise
+            break
+        f.write(buffer)
+        await self.save(f)
+        f.seek(0)
+
+        async def read(n=-1):
+            return f.read(n)
+
+        async def close():
+            f.close()
+            os.remove(tmpname)
+
+        self._read = read
+        self._close = close
+        return self
+
+    async def close(self):
+        """Close an open file.
+
+        This method must be called to free memory or temporary files created by
+        the ``copy()`` method.
+
+        Note that when using the ``@with_form_data`` decorator this method is
+        called automatically when the request ends.
+        """
+        if self._close:
+            await self._close()
+            self._close = None
+
+
+def with_form_data(f):
+    """Decorator that parses a ``multipart/form-data`` body and updates the
+    request object with the parsed form fields and files.
+
+    Example usage::
+
+        from microdot.multipart import with_form_data
+
+        @app.post('/upload')
+        @with_form_data
+        async def upload(request):
+            print('form fields:', request.form)
+            print('files:', request.files)
+
+    Note: this decorator calls the :meth:`FileUpload.copy()
+    <microdot.multipart.FileUpload.copy>` method on all uploaded files, so that
+    the request can be parsed in its entirety. The files are either copied to
+    memory or a temporary file, depending on their size. The temporary files
+    are automatically deleted when the request ends.
+    """
+    @wraps(f)
+    async def wrapper(request, *args, **kwargs):
+        form = {}
+        files = {}
+        async for name, value in FormDataIter(request):
+            if isinstance(value, FileUpload):
+                files[name] = await value.copy()
+            else:
+                form[name] = value
+        if form or files:
+            request._form = form
+            request._files = files
+        try:
+            ret = f(request, *args, **kwargs)
+            if iscoroutine(ret):
+                ret = await ret
+        finally:
+            if request.files:
+                for file in request.files.values():
+                    await file.close()
+        return ret
+    return wrapper
+
+
+路徑/microdot/session.py內容如下：
+import jwt
+from microdot.microdot import invoke_handler
+from microdot.helpers import wraps
+
+
+class SessionDict(dict):
+    """A session dictionary.
+
+    The session dictionary is a standard Python dictionary that has been
+    extended with convenience ``save()`` and ``delete()`` methods.
+    """
+    def __init__(self, request, session_dict):
+        super().__init__(session_dict)
+        self.request = request
+
+    def save(self):
+        """Update the session cookie."""
+        self.request.app._session.update(self.request, self)
+
+    def delete(self):
+        """Delete the session cookie."""
+        self.request.app._session.delete(self.request)
+
+
+class Session:
+    """
+    :param app: The application instance.
+    :param key: The secret key, as a string or bytes object.
+    """
+    secret_key = None
+
+    def __init__(self, app=None, secret_key=None, cookie_options=None):
+        self.secret_key = secret_key
+        self.cookie_options = cookie_options or {}
+        if app is not None:
+            self.initialize(app)
+
+    def initialize(self, app, secret_key=None, cookie_options=None):
+        if secret_key is not None:
+            self.secret_key = secret_key
+        if cookie_options is not None:
+            self.cookie_options = cookie_options
+        if 'path' not in self.cookie_options:
+            self.cookie_options['path'] = '/'
+        if 'http_only' not in self.cookie_options:
+            self.cookie_options['http_only'] = True
+        app._session = self
+
+    def get(self, request):
+        """Retrieve the user session.
+
+        :param request: The client request.
+
+        The return value is a session dictionary with the data stored in the
+        user's session, or ``{}`` if the session data is not available or
+        invalid.
+        """
+        if not self.secret_key:
+            raise ValueError('The session secret key is not configured')
+        if hasattr(request.g, '_session'):
+            return request.g._session
+        session = request.cookies.get('session')
+        if session is None:
+            request.g._session = SessionDict(request, {})
+            return request.g._session
+        request.g._session = SessionDict(request, self.decode(session))
+        return request.g._session
+
+    def update(self, request, session):
+        """Update the user session.
+
+        :param request: The client request.
+        :param session: A dictionary with the update session data for the user.
+
+        Applications would normally not call this method directly, instead they
+        would use the :meth:`SessionDict.save` method on the session
+        dictionary, which calls this method. For example::
+
+            @app.route('/')
+            @with_session
+            def index(request, session):
+                session['foo'] = 'bar'
+                session.save()
+                return 'Hello, World!'
+
+        Calling this method adds a cookie with the updated session to the
+        request currently being processed.
+        """
+        if not self.secret_key:
+            raise ValueError('The session secret key is not configured')
+
+        encoded_session = self.encode(session)
+
+        @request.after_request
+        def _update_session(request, response):
+            response.set_cookie('session', encoded_session,
+                                **self.cookie_options)
+            return response
+
+    def delete(self, request):
+        """Remove the user session.
+
+        :param request: The client request.
+
+        Applications would normally not call this method directly, instead they
+        would use the :meth:`SessionDict.delete` method on the session
+        dictionary, which calls this method. For example::
+
+            @app.route('/')
+            @with_session
+            def index(request, session):
+                session.delete()
+                return 'Hello, World!'
+
+        Calling this method adds a cookie removal header to the request
+        currently being processed.
+        """
+        @request.after_request
+        def _delete_session(request, response):
+            response.delete_cookie('session', **self.cookie_options)
+            return response
+
+    def encode(self, payload, secret_key=None):
+        return jwt.encode(payload, secret_key or self.secret_key,
+                          algorithm='HS256')
+
+    def decode(self, session, secret_key=None):
+        try:
+            payload = jwt.decode(session, secret_key or self.secret_key,
+                                 algorithms=['HS256'])
+        except jwt.exceptions.PyJWTError:  # pragma: no cover
+            return {}
+        return payload
+
+
+def with_session(f):
+    """Decorator that passes the user session to the route handler.
+
+    The session dictionary is passed to the decorated function as an argument
+    after the request object. Example::
+
+        @app.route('/')
+        @with_session
+        def index(request, session):
+            return 'Hello, World!'
+
+    Note that the decorator does not save the session. To update the session,
+    call the :func:`session.save() <microdot.session.SessionDict.save>` method.
+    """
+    @wraps(f)
+    async def wrapper(request, *args, **kwargs):
+        return await invoke_handler(
+            f, request, request.app._session.get(request), *args, **kwargs)
+
+    return wrapper
+
+
+路徑/microdot/sse.py內容如下：
+import asyncio
+from microdot.helpers import wraps
+
+try:
+    import orjson as json
+except ImportError:
+    import json
+
+
+class SSE:
+    """Server-Sent Events object.
+
+    An object of this class is sent to handler functions to manage the SSE
+    connection.
+    """
+    def __init__(self):
+        self.event = asyncio.Event()
+        self.queue = []
+
+    async def send(self, data, event=None, event_id=None):
+        """Send an event to the client.
+
+        :param data: the data to send. It can be given as a string, bytes, dict
+                     or list. Dictionaries and lists are serialized to JSON.
+                     Any other types are converted to string before sending.
+        :param event: an optional event name, to send along with the data. If
+                      given, it must be a string.
+        :param event_id: an optional event id, to send along with the data. If
+                      given, it must be a string.
+        """
+        if isinstance(data, (dict, list)):
+            data = json.dumps(data)
+        if isinstance(data, str):
+            data = data.encode()
+        elif not isinstance(data, bytes):
+            data = str(data).encode()
+        data = b'data: ' + data + b'\n\n'
+        if event_id:
+            data = b'id: ' + event_id.encode() + b'\n' + data
+        if event:
+            data = b'event: ' + event.encode() + b'\n' + data
+        self.queue.append(data)
+        self.event.set()
+
+
+def sse_response(request, event_function, *args, **kwargs):
+    """Return a response object that initiates an event stream.
+
+    :param request: the request object.
+    :param event_function: an asynchronous function that will send events to
+                           the client. The function is invoked with ``request``
+                           and an ``sse`` object. The function should use
+                           ``sse.send()`` to send events to the client.
+    :param args: additional positional arguments to be passed to the response.
+    :param kwargs: additional keyword arguments to be passed to the response.
+
+    This is a low-level function that can be used to implement a custom SSE
+    endpoint. In general the :func:`microdot.sse.with_sse` decorator should be
+    used instead.
+    """
+    sse = SSE()
+
+    async def sse_task_wrapper():
+        try:
+            await event_function(request, sse, *args, **kwargs)
+        except asyncio.CancelledError:  # pragma: no cover
+            pass
+        except Exception as exc:
+            # the SSE task raised an exception so we need to pass it to the
+            # main route so that it is re-raised there
+            sse.queue.append(exc)
+        sse.event.set()
+
+    task = asyncio.create_task(sse_task_wrapper())
+
+    class sse_loop:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            event = None
+            while sse.queue or not task.done():
+                try:
+                    event = sse.queue.pop(0)
+                    break
+                except IndexError:
+                    await sse.event.wait()
+                    sse.event.clear()
+            if isinstance(event, Exception):
+                # if the event is an exception we re-raise it here so that it
+                # can be handled appropriately
+                raise event
+            elif event is None:
+                raise StopAsyncIteration
+            return event
+
+        async def aclose(self):
+            task.cancel()
+
+    return sse_loop(), 200, {'Content-Type': 'text/event-stream'}
+
+
+def with_sse(f):
+    """Decorator to make a route a Server-Sent Events endpoint.
+
+    This decorator is used to define a route that accepts SSE connections. The
+    route then receives a sse object as a second argument that it can use to
+    send events to the client::
+
+        @app.route('/events')
+        @with_sse
+        async def events(request, sse):
+            # send an unnamed event with string data
+            await sse.send('hello')
+
+            # send an unnamed event with JSON data
+            await sse.send({'foo': 'bar'})
+
+            # send a named event
+            await sse.send('hello', event='greeting')
+    """
+    @wraps(f)
+    async def sse_handler(request, *args, **kwargs):
+        return sse_response(request, f, *args, **kwargs)
+
+    return sse_handler
+
+
+路徑/microdot/test_client.py內容如下：
+import asyncio
+from microdot.microdot import Request, Response, AsyncBytesIO
+
+try:
+    from microdot.websocket import WebSocket
+except:  # pragma: no cover  # noqa: E722
+    WebSocket = None
+
+try:
+    import orjson as json
+except ImportError:
+    import json
+
+__all__ = ['TestClient', 'TestResponse']
+
+
+class TestResponse:
+    """A response object issued by the Microdot test client."""
+    def __init__(self):
+        #: The numeric status code returned by the server.
+        self.status_code = None
+        #: The text reason associated with the status response, such as
+        #: ``'OK'`` or ``'NOT FOUND'``. Set to ``None`` unless the application
+        #: explicitly sets it on the response object.
+        self.reason = None
+        #: A dictionary with the response headers.
+        self.headers = {}
+        #: The body of the response, as a bytes object.
+        self.body = None
+        #: The body of the response, decoded to a UTF-8 string. Set to
+        #: ``None`` if the response cannot be represented as UTF-8 text.
+        self.text = None
+        #: The body of the JSON response, decoded to a dictionary or list. Set
+        #: ``Note`` if the response does not have a JSON payload.
+        self.json = None
+        #: The body of the SSE response, decoded to a list of events, each
+        #: given as a dictionary with a ``data`` key and optionally also
+        #: ``event`` and ``id`` keys. Set to ``None`` if the response does not
+        #: have an SSE payload.
+        self.events = None
+
+    def _initialize_response(self, res):
+        self.status_code = res.status_code
+        self.reason = res.reason
+        self.headers = res.headers
+
+    async def _initialize_body(self, res):
+        self.body = b''
+        iter = res.body_iter()
+        try:
+            async for body in iter:  # pragma: no branch
+                if isinstance(body, str):
+                    body = body.encode()
+                self.body += body
+        except asyncio.CancelledError:  # pragma: no cover
+            pass
+        if hasattr(iter, 'aclose'):  # pragma: no branch
+            await iter.aclose()
+
+    def _process_text_body(self):
+        try:
+            self.text = self.body.decode()
+        except ValueError:
+            pass
+
+    def _process_json_body(self):
+        if 'Content-Type' in self.headers:  # pragma: no branch
+            content_type = self.headers['Content-Type']
+            if content_type.split(';')[0] == 'application/json':
+                self.json = json.loads(self.text)
+
+    def _process_sse_body(self):
+        if 'Content-Type' in self.headers:  # pragma: no branch
+            content_type = self.headers['Content-Type']
+            if content_type.split(';')[0] == 'text/event-stream':
+                self.events = []
+                for sse_event in self.body.split(b'\n\n'):
+                    data = None
+                    event = None
+                    event_id = None
+                    for line in sse_event.split(b'\n'):
+                        if line.startswith(b'data:'):
+                            data = line[5:].strip()
+                        elif line.startswith(b'event:'):
+                            event = line[6:].strip().decode()
+                        elif line.startswith(b'id:'):
+                            event_id = line[3:].strip().decode()
+                    if data:
+                        data_json = None
+                        try:
+                            data_json = json.loads(data)
+                        except ValueError:
+                            pass
+                        self.events.append({
+                            "data": data, "data_json": data_json,
+                            "event": event, "event_id": event_id})
+
+    @classmethod
+    async def create(cls, res):
+        test_res = cls()
+        test_res._initialize_response(res)
+        if not res.is_head:
+            await test_res._initialize_body(res)
+            test_res._process_text_body()
+            test_res._process_json_body()
+            test_res._process_sse_body()
+        return test_res
+
+
+class TestClient:
+    """A test client for Microdot.
+
+    :param app: The Microdot application instance.
+    :param cookies: A dictionary of cookies to use when sending requests to the
+                    application.
+
+    The following example shows how to create a test client for an application
+    and send a test request::
+
+        from microdot import Microdot
+
+        app = Microdot()
+
+        @app.get('/')
+        async def index():
+            return 'Hello, World!'
+
+        async def test_hello_world(self):
+            client = TestClient(app)
+            res = await client.get('/')
+            assert res.status_code == 200
+            assert res.text == 'Hello, World!'
+    """
+    __test__ = False  # remove this class from pytest's test collection
+
+    def __init__(self, app, cookies=None):
+        self.app = app
+        self.cookies = cookies or {}
+
+    def _process_body(self, body, headers):
+        if body is None:
+            body = b''
+        elif isinstance(body, (dict, list)):
+            body = json.dumps(body)
+            if 'Content-Type' not in headers:  # pragma: no cover
+                headers['Content-Type'] = 'application/json'
+        if isinstance(body, str):
+            body = body.encode()
+        if body and 'Content-Length' not in headers:
+            headers['Content-Length'] = str(len(body))
+        if 'Host' not in headers:  # pragma: no branch
+            headers['Host'] = 'example.com:1234'
+        return body, headers
+
+    def _process_cookies(self, path, headers):
+        cookies = ''
+        for name, value in self.cookies.items():
+            if isinstance(value, tuple):
+                value, cookie_path = value
+                if not path.startswith(cookie_path):
+                    continue
+            if cookies:
+                cookies += '; '
+            cookies += name + '=' + value
+        if cookies:
+            if 'Cookie' in headers:
+                headers['Cookie'] += '; ' + cookies
+            else:
+                headers['Cookie'] = cookies
+        return headers
+
+    def _render_request(self, method, path, headers, body):
+        request_bytes = '{method} {path} HTTP/1.0\n'.format(
+            method=method, path=path)
+        for header, value in headers.items():
+            request_bytes += '{header}: {value}\n'.format(
+                header=header, value=value)
+        request_bytes = request_bytes.encode() + b'\n' + body
+        return request_bytes
+
+    def _update_cookies(self, res):
+        cookies = res.headers.get('Set-Cookie', [])
+        for cookie in cookies:
+            cookie_name, cookie_value = cookie.split('=', 1)
+            cookie_options = cookie_value.split(';')
+            path = '/'
+            delete = False
+            for option in cookie_options[1:]:
+                option = option.strip().lower()
+                if option.startswith(
+                        'max-age='):  # pragma: no cover
+                    _, age = option.split('=', 1)
+                    try:
+                        age = int(age)
+                    except ValueError:  # pragma: no cover
+                        age = 0
+                    if age <= 0:
+                        delete = True
+                elif option.startswith('expires='):
+                    _, e = option.split('=', 1)
+                    # this is a very limited parser for cookie expiry
+                    # that only detects a cookie deletion request when
+                    # the date is 1/1/1970
+                    if '1 jan 1970' in e.lower():  # pragma: no branch
+                        delete = True
+                elif option.startswith('path='):
+                    _, path = option.split('=', 1)
+            if delete:
+                if cookie_name in self.cookies:  # pragma: no branch
+                    cookie_path = self.cookies[cookie_name][1] \
+                        if isinstance(self.cookies[cookie_name], tuple) \
+                        else '/'
+                    if path == cookie_path:
+                        del self.cookies[cookie_name]
+            else:
+                if path == '/':
+                    self.cookies[cookie_name] = cookie_options[0]
+                else:
+                    self.cookies[cookie_name] = (cookie_options[0], path)
+
+    async def request(self, method, path, headers=None, body=None, sock=None):
+        headers = headers or {}
+        body, headers = self._process_body(body, headers)
+        headers = self._process_cookies(path, headers)
+        request_bytes = self._render_request(method, path, headers, body)
+        if sock:
+            reader = sock[0]
+            reader.buffer = request_bytes
+            writer = sock[1]
+        else:
+            reader = AsyncBytesIO(request_bytes)
+            writer = AsyncBytesIO(b'')
+
+        req = await Request.create(self.app, reader, writer,
+                                   ('127.0.0.1', 1234))
+        res = await self.app.dispatch_request(req)
+        if res == Response.already_handled:
+            return TestResponse()
+        res.complete()
+
+        self._update_cookies(res)
+        return await TestResponse.create(res)
+
+    async def get(self, path, headers=None):
+        """Send a GET request to the application.
+
+        :param path: The request URL.
+        :param headers: A dictionary of headers to send with the request.
+
+        This method returns a
+        :class:`TestResponse <microdot_test_client.TestResponse>` object.
+        """
+        return await self.request('GET', path, headers=headers)
+
+    async def post(self, path, headers=None, body=None):
+        """Send a POST request to the application.
+
+        :param path: The request URL.
+        :param headers: A dictionary of headers to send with the request.
+        :param body: The request body. If a dictionary or list is provided,
+                     a JSON-encoded body will be sent. A string body is encoded
+                     to bytes as UTF-8. A bytes body is sent as-is.
+
+        This method returns a
+        :class:`TestResponse <microdot_test_client.TestResponse>` object.
+        """
+        return await self.request('POST', path, headers=headers, body=body)
+
+    async def put(self, path, headers=None, body=None):
+        """Send a PUT request to the application.
+
+        :param path: The request URL.
+        :param headers: A dictionary of headers to send with the request.
+        :param body: The request body. If a dictionary or list is provided,
+                     a JSON-encoded body will be sent. A string body is encoded
+                     to bytes as UTF-8. A bytes body is sent as-is.
+
+        This method returns a
+        :class:`TestResponse <microdot_test_client.TestResponse>` object.
+        """
+        return await self.request('PUT', path, headers=headers, body=body)
+
+    async def patch(self, path, headers=None, body=None):
+        """Send a PATCH request to the application.
+
+        :param path: The request URL.
+        :param headers: A dictionary of headers to send with the request.
+        :param body: The request body. If a dictionary or list is provided,
+                     a JSON-encoded body will be sent. A string body is encoded
+                     to bytes as UTF-8. A bytes body is sent as-is.
+
+        This method returns a
+        :class:`TestResponse <microdot_test_client.TestResponse>` object.
+        """
+        return await self.request('PATCH', path, headers=headers, body=body)
+
+    async def delete(self, path, headers=None):
+        """Send a DELETE request to the application.
+
+        :param path: The request URL.
+        :param headers: A dictionary of headers to send with the request.
+
+        This method returns a
+        :class:`TestResponse <microdot_test_client.TestResponse>` object.
+        """
+        return await self.request('DELETE', path, headers=headers)
+
+    async def websocket(self, path, client, headers=None):
+        """Send a websocket connection request to the application.
+
+        :param path: The request URL.
+        :param client: A generator function that yields client messages.
+        :param headers: A dictionary of headers to send with the request.
+        """
+        gen = client()
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.started = False
+                self.closed = False
+                self.buffer = b''
+
+            async def _next(self, data=None):
+                try:
+                    data = (await gen.asend(data)) if hasattr(gen, 'asend') \
+                        else gen.send(data)
+                except (StopIteration, StopAsyncIteration):
+                    if not self.closed:
+                        self.closed = True
+                        raise OSError(32, 'Websocket connection closed')
+                    return  # pragma: no cover
+                opcode = WebSocket.TEXT if isinstance(data, str) \
+                    else WebSocket.BINARY
+                return WebSocket._encode_websocket_frame(opcode, data)
+
+            async def read(self, n):
+                if not self.buffer:
+                    self.started = True
+                    self.buffer = await self._next()
+                data = self.buffer[:n]
+                self.buffer = self.buffer[n:]
+                return data
+
+            async def readexactly(self, n):  # pragma: no cover
+                return await self.read(n)
+
+            async def readline(self):
+                line = b''
+                while True:
+                    line += await self.read(1)
+                    if line[-1] in [b'\n', 10]:
+                        break
+                return line
+
+            async def awrite(self, data):
+                if self.started:
+                    h = WebSocket._parse_frame_header(data[0:2])
+                    if h[1] not in [WebSocket.TEXT, WebSocket.BINARY]:
+                        return
+                    if h[3] < 0:
+                        data = data[2 - h[3]:]
+                    else:
+                        data = data[2:]
+                    if h[1] == WebSocket.TEXT:
+                        data = data.decode()
+                    self.buffer = await self._next(data)
+
+        ws_headers = {
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Sec-WebSocket-Version': '13',
+            'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+        }
+        ws_headers.update(headers or {})
+        sock = FakeWebSocket()
+        return await self.request('GET', path, headers=ws_headers,
+                                  sock=(sock, sock))
+
+
+路徑/microdot/utemplate.py內容如下：
+from utemplate import recompile
+
+_loader = None
+
+
+class Template:
+    """A template object.
+
+    :param template: The filename of the template to render, relative to the
+                     configured template directory.
+    """
+    @classmethod
+    def initialize(cls, template_dir='templates',
+                   loader_class=recompile.Loader):
+        """Initialize the templating subsystem.
+
+        :param template_dir: the directory where templates are stored. This
+                             argument is optional. The default is to load
+                             templates from a *templates* subdirectory.
+        :param loader_class: the ``utemplate.Loader`` class to use when loading
+                             templates. This argument is optional. The default
+                             is the ``recompile.Loader`` class, which
+                             automatically recompiles templates when they
+                             change.
+        """
+        global _loader
+        _loader = loader_class(None, template_dir)
+
+    def __init__(self, template):
+        if _loader is None:  # pragma: no cover
+            self.initialize()
+        #: The name of the template
+        self.name = template
+        self.template = _loader.load(template)
+
+    def generate(self, *args, **kwargs):
+        """Return a generator that renders the template in chunks, with the
+        given arguments."""
+        return self.template(*args, **kwargs)
+
+    def render(self, *args, **kwargs):
+        """Render the template with the given arguments and return it as a
+        string."""
+        return ''.join(self.generate(*args, **kwargs))
+
+    def generate_async(self, *args, **kwargs):
+        """Return an asynchronous generator that renders the template in
+        chunks, using the given arguments."""
+        class sync_to_async_iter():
+            def __init__(self, iter):
+                self.iter = iter
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.iter)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        return sync_to_async_iter(self.generate(*args, **kwargs))
+
+    async def render_async(self, *args, **kwargs):
+        """Render the template with the given arguments asynchronously and
+        return it as a string."""
+        response = ''
+        async for chunk in self.generate_async(*args, **kwargs):
+            response += chunk
+        return response
+
+
+路徑/microdot/websocket.py內容如下：
+import binascii
+import hashlib
+from microdot import Request, Response
+from microdot.microdot import MUTED_SOCKET_ERRORS, print_exception
+from microdot.helpers import wraps
+
+
+class WebSocketError(Exception):
+    """Exception raised when an error occurs in a WebSocket connection."""
+    pass
+
+
+class WebSocket:
+    """A WebSocket connection object.
+
+    An instance of this class is sent to handler functions to manage the
+    WebSocket connection.
+    """
+    CONT = 0
+    TEXT = 1
+    BINARY = 2
+    CLOSE = 8
+    PING = 9
+    PONG = 10
+
+    #: Specify the maximum message size that can be received when calling the
+    #: ``receive()`` method. Messages with payloads that are larger than this
+    #: size will be rejected and the connection closed. Set to 0 to disable
+    #: the size check (be aware of potential security issues if you do this),
+    #: or to -1 to use the value set in
+    #: ``Request.max_body_length``. The default is -1.
+    #:
+    #: Example::
+    #:
+    #:    WebSocket.max_message_length = 4 * 1024  # up to 4KB messages
+    max_message_length = -1
+
+    def __init__(self, request):
+        self.request = request
+        self.closed = False
+
+    async def handshake(self):
+        response = self._handshake_response()
+        await self.request.sock[1].awrite(
+            b'HTTP/1.1 101 Switching Protocols\r\n')
+        await self.request.sock[1].awrite(b'Upgrade: websocket\r\n')
+        await self.request.sock[1].awrite(b'Connection: Upgrade\r\n')
+        await self.request.sock[1].awrite(
+            b'Sec-WebSocket-Accept: ' + response + b'\r\n\r\n')
+
+    async def receive(self):
+        """Receive a message from the client."""
+        while True:
+            opcode, payload = await self._read_frame()
+            send_opcode, data = self._process_websocket_frame(opcode, payload)
+            if send_opcode:  # pragma: no cover
+                await self.send(data, send_opcode)
+            elif data:  # pragma: no branch
+                return data
+
+    async def send(self, data, opcode=None):
+        """Send a message to the client.
+
+        :param data: the data to send, given as a string or bytes.
+        :param opcode: a custom frame opcode to use. If not given, the opcode
+                       is ``TEXT`` or ``BINARY`` depending on the type of the
+                       data.
+        """
+        frame = self._encode_websocket_frame(
+            opcode or (self.TEXT if isinstance(data, str) else self.BINARY),
+            data)
+        await self.request.sock[1].awrite(frame)
+
+    async def close(self):
+        """Close the websocket connection."""
+        if not self.closed:  # pragma: no cover
+            self.closed = True
+            await self.send(b'', self.CLOSE)
+
+    def _handshake_response(self):
+        connection = False
+        upgrade = False
+        websocket_key = None
+        for header, value in self.request.headers.items():
+            h = header.lower()
+            if h == 'connection':
+                connection = True
+                if 'upgrade' not in value.lower():
+                    return self.request.app.abort(400)
+            elif h == 'upgrade':
+                upgrade = True
+                if not value.lower() == 'websocket':
+                    return self.request.app.abort(400)
+            elif h == 'sec-websocket-key':
+                websocket_key = value
+        if not connection or not upgrade or not websocket_key:
+            return self.request.app.abort(400)
+        d = hashlib.sha1(websocket_key.encode())
+        d.update(b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+        return binascii.b2a_base64(d.digest())[:-1]
+
+    @classmethod
+    def _parse_frame_header(cls, header):
+        fin = header[0] & 0x80
+        opcode = header[0] & 0x0f
+        if fin == 0 or opcode == cls.CONT:  # pragma: no cover
+            raise WebSocketError('Continuation frames not supported')
+        has_mask = header[1] & 0x80
+        length = header[1] & 0x7f
+        if length == 126:
+            length = -2
+        elif length == 127:
+            length = -8
+        return fin, opcode, has_mask, length
+
+    def _process_websocket_frame(self, opcode, payload):
+        if opcode == self.TEXT:
+            payload = payload.decode()
+        elif opcode == self.BINARY:
+            pass
+        elif opcode == self.CLOSE:
+            raise WebSocketError('Websocket connection closed')
+        elif opcode == self.PING:
+            return self.PONG, payload
+        elif opcode == self.PONG:  # pragma: no branch
+            return None, None
+        return None, payload
+
+    @classmethod
+    def _encode_websocket_frame(cls, opcode, payload):
+        frame = bytearray()
+        frame.append(0x80 | opcode)
+        if opcode == cls.TEXT:
+            payload = payload.encode()
+        if len(payload) < 126:
+            frame.append(len(payload))
+        elif len(payload) < (1 << 16):
+            frame.append(126)
+            frame.extend(len(payload).to_bytes(2, 'big'))
+        else:
+            frame.append(127)
+            frame.extend(len(payload).to_bytes(8, 'big'))
+        frame.extend(payload)
+        return frame
+
+    async def _read_frame(self):
+        header = await self.request.sock[0].read(2)
+        if len(header) != 2:  # pragma: no cover
+            raise WebSocketError('Websocket connection closed')
+        fin, opcode, has_mask, length = self._parse_frame_header(header)
+        if length == -2:
+            length = await self.request.sock[0].readexactly(2)
+            length = int.from_bytes(length, 'big')
+        elif length == -8:
+            length = await self.request.sock[0].readexactly(8)
+            length = int.from_bytes(length, 'big')
+        max_allowed_length = Request.max_body_length \
+            if self.max_message_length == -1 else self.max_message_length
+        if length > max_allowed_length:
+            raise WebSocketError('Message too large')
+        if has_mask:  # pragma: no cover
+            mask = await self.request.sock[0].readexactly(4)
+        payload = await self.request.sock[0].readexactly(length)
+        if has_mask:  # pragma: no cover
+            payload = bytes(x ^ mask[i % 4] for i, x in enumerate(payload))
+        return opcode, payload
+
+
+async def websocket_upgrade(request):
+    """Upgrade a request handler to a websocket connection.
+
+    This function can be called directly inside a route function to process a
+    WebSocket upgrade handshake, for example after the user's credentials are
+    verified. The function returns the websocket object::
+
+        @app.route('/echo')
+        async def echo(request):
+            if not authenticate_user(request):
+                abort(401)
+            ws = await websocket_upgrade(request)
+            while True:
+                message = await ws.receive()
+                await ws.send(message)
+    """
+    ws = WebSocket(request)
+    await ws.handshake()
+
+    @request.after_request
+    async def after_request(request, response):
+        return Response.already_handled
+
+    return ws
+
+
+def websocket_wrapper(f, upgrade_function):
+    @wraps(f)
+    async def wrapper(request, *args, **kwargs):
+        ws = await upgrade_function(request)
+        try:
+            await f(request, ws, *args, **kwargs)
+        except OSError as exc:
+            if exc.errno not in MUTED_SOCKET_ERRORS:  # pragma: no cover
+                raise
+        except WebSocketError:
+            pass
+        except Exception as exc:
+            print_exception(exc)
+        finally:  # pragma: no cover
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        return Response.already_handled
+    return wrapper
+
+
+def with_websocket(f):
+    """Decorator to make a route a WebSocket endpoint.
+
+    This decorator is used to define a route that accepts websocket
+    connections. The route then receives a websocket object as a second
+    argument that it can use to send and receive messages::
+
+        @app.route('/echo')
+        @with_websocket
+        async def echo(request, ws):
+            while True:
+                message = await ws.receive()
+                await ws.send(message)
+    """
+    return websocket_wrapper(f, websocket_upgrade)
+
+
+路徑/microdot/wsgi.py內容如下：
+import asyncio
+import os
+import signal
+from microdot import *  # noqa: F401, F403
+from microdot.microdot import Microdot as BaseMicrodot, Request, NoCaseDict, \
+    MUTED_SOCKET_ERRORS
+from microdot.websocket import WebSocket, websocket_upgrade, \
+    with_websocket  # noqa: F401
+
+
+class Microdot(BaseMicrodot):
+    """A subclass of the core :class:`Microdot <microdot.Microdot>` class that
+    implements the WSGI protocol.
+
+    This class must be used as the application instance when running under a
+    WSGI web server.
+    """
+    def __init__(self):
+        super().__init__()
+        self.loop = asyncio.new_event_loop()
+        self.embedded_server = False
+
+    def wsgi_app(self, environ, start_response):
+        """A WSGI application callable."""
+        path = environ.get('SCRIPT_NAME', '') + environ.get('PATH_INFO', '')
+        if 'QUERY_STRING' in environ and environ['QUERY_STRING']:
+            path += '?' + environ['QUERY_STRING']
+        headers = NoCaseDict()
+        content_length = 0
+        for k, value in environ.items():
+            if k.startswith('HTTP_'):
+                key = '-'.join([p.title() for p in k[5:].split('_')])
+                headers[key] = value
+            elif k == 'CONTENT_TYPE':
+                headers['Content-Type'] = value
+            elif k == 'CONTENT_LENGTH':
+                headers['Content-Length'] = value
+                content_length = int(value)
+
+        class sync_to_async_body_stream():  # pragma: no cover
+            def __init__(self, wsgi_input=None):
+                self.wsgi_input = wsgi_input
+
+            async def read(self, n=-1):
+                return self.wsgi_input.read(n)
+
+            async def readline(self):
+                return self.wsgi_input.readline()
+
+            async def readexactly(self, n):
+                return self.wsgi_input.read(n)
+
+        wsgi_input = environ.get('wsgi.input')
+        if content_length and content_length <= Request.max_body_length:
+            # the request came with a body that is within the allowed size
+            body = wsgi_input.read(content_length)
+            stream = None
+            sock = (None, None)
+        else:
+            body = b''
+            if content_length:
+                # the request came with a body that is too large to fit in
+                # memory, so we stream it
+                stream = sync_to_async_body_stream(wsgi_input)
+                sock = (None, None)
+            else:
+                # the request did not declare a body size, so we connect the
+                # raw socket if available
+                stream = None
+                if 'gunicorn.socket' in environ:  # pragma: no cover
+                    reader, writer = self.loop.run_until_complete(
+                        asyncio.open_connection(
+                            sock=environ['gunicorn.socket'].dup()))
+                    if not hasattr(writer, 'awrite'):  # pragma: no cover
+                        async def awrite(self, data):
+                            self.write(data)
+                            await self.drain()
+
+                        async def aclose(self):
+                            self.close()
+                            await self.wait_closed()
+
+                        from types import MethodType
+                        writer.awrite = MethodType(awrite, writer)
+                        writer.aclose = MethodType(aclose, writer)
+                    sock = (reader, writer)
+                else:
+                    sock = (None, None)
+
+        req = Request(
+            self,
+            (environ['REMOTE_ADDR'], int(environ.get('REMOTE_PORT', '0'))),
+            environ['REQUEST_METHOD'],
+            path,
+            environ['SERVER_PROTOCOL'],
+            headers,
+            body=body,
+            stream=stream,
+            sock=sock)
+        req.environ = environ
+
+        res = self.loop.run_until_complete(self.dispatch_request(req))
+        res.complete()
+        if sock[1]:  # pragma: no cover
+            try:
+                self.loop.run_until_complete(sock[1].aclose())
+            except OSError as exc:  # pragma: no cover
+                if exc.errno in MUTED_SOCKET_ERRORS:
+                    pass
+                else:
+                    raise
+
+        reason = res.reason or ('OK' if res.status_code == 200 else 'N/A')
+        header_list = []
+        for name, value in res.headers.items():
+            if not isinstance(value, list):
+                header_list.append((name, value))
+            else:
+                for v in value:
+                    header_list.append((name, v))
+        start_response(str(res.status_code) + ' ' + reason, header_list)
+
+        class async_to_sync_iter():
+            def __init__(self, iter, loop):
+                self.iter = iter.__aiter__()
+                self.loop = loop
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                try:
+                    return self.loop.run_until_complete(self.iter.__anext__())
+                except StopAsyncIteration:
+                    raise StopIteration
+
+            def close(self):  # pragma: no cover
+                if hasattr(self.iter, 'aclose'):
+                    self.loop.run_until_complete(self.iter.aclose())
+
+        return async_to_sync_iter(res.body_iter(), self.loop)
+
+    def __call__(self, environ, start_response):
+        return self.wsgi_app(environ, start_response)
+
+    def shutdown(self):
+        if self.embedded_server:  # pragma: no cover
+            super().shutdown()
+        else:
+            pid = os.getpgrp() if hasattr(os, 'getpgrp') else os.getpid()
+            os.kill(pid, signal.SIGTERM)
+
+    def run(self, host='0.0.0.0', port=5000, debug=False,
+            **options):  # pragma: no cover
+        """Normally you would not start the server by invoking this method.
+        Instead, start your chosen WSGI web server and pass the ``Microdot``
+        instance as the WSGI callable.
+        """
+        self.embedded_server = True
+        super().run(host=host, port=port, debug=debug, **options)
+
+
