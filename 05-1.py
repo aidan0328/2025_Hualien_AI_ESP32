@@ -1,86 +1,86 @@
 # 實驗 #5-1：使用可變電阻調整LED的明亮度
+# MicroPython v1.24.0 on ESP32-DevKitC
 
-# ----------------------------------------------------
-# 匯入所需模組
-# ----------------------------------------------------
 import machine
 import time
-from collections import deque
 
-# ----------------------------------------------------
-# 硬體腳位與常數設定
-# ----------------------------------------------------
-# 可變電阻連接的 ADC 腳位
-VR_PIN = 36
-
-# 綠色 LED 連接的 GPIO 腳位
+# --- 硬體腳位定義 ---
+# 使用常數來定義腳位，方便管理與修改
+ADC_PIN = 36
 GREEN_LED_PIN = 21
+YELLOW_LED_PIN = 19
+RED_LED_PIN = 18
 
-# 移動平均的樣本數
-ADC_SAMPLES = 10
+# --- 初始化 Pin 和 ADC 物件 ---
+# 初始化 ADC
+# GPIO36 是 ADC1 的通道 0
+# 設定衰減比為 11dB，這樣才能讀取完整的 0-3.3V 電壓範圍
+adc = machine.ADC(machine.Pin(ADC_PIN))
+adc.atten(machine.ADC.ATTN_11DB)
 
-# ADC 的最大讀值 (ESP32 為 12-bit: 2^12 - 1 = 4095)
-ADC_MAX_VALUE = 4095
+# 初始化 LED
+# 紅色和黃色 LED 設定為輸出模式並直接關閉
+red_led = machine.Pin(RED_LED_PIN, machine.Pin.OUT)
+yellow_led = machine.Pin(YELLOW_LED_PIN, machine.Pin.OUT)
+red_led.off()
+yellow_led.off()
 
-# PWM 的最大 duty cycle 值 (duty_u16 使用 16-bit: 2^16 - 1 = 65535)
-PWM_MAX_DUTY = 65535
+# 綠色 LED 需要 PWM 功能來控制亮度
+# 建立 PWM 物件，頻率設定為 1000 Hz 可以避免人眼可見的閃爍
+pwm_green = machine.PWM(machine.Pin(GREEN_LED_PIN), freq=1000)
 
-# ----------------------------------------------------
-# 硬體初始化
-# ----------------------------------------------------
-# 1. 初始化 ADC
-# 設定 ADC 腳位
-adc_pin = machine.Pin(VR_PIN, machine.Pin.IN)
-# 建立 ADC 物件
-adc = machine.ADC(adc_pin)
-# 設定衰減，ATTN_11DB 對應 0V-3.3V 的完整電壓範圍
-adc.atten(machine.ADC.ATTN_11DB) 
 
-# 2. 初始化綠色 LED 的 PWM
-# 設定 LED 腳位為輸出
-green_led_pin = machine.Pin(GREEN_LED_PIN, machine.Pin.OUT)
-# 建立 PWM 物件，頻率設定為 1000 Hz 以避免人眼閃爍感
-green_pwm = machine.PWM(green_led_pin, freq=1000)
+# --- 移動平均 (Moving Average) 相關設定 ---
+# 設定要取樣的讀值數量
+NUM_READINGS = 10
 
-# ----------------------------------------------------
-# 移動平均初始化
-# ----------------------------------------------------
-# 使用 deque (雙向佇列) 來儲存最新的10筆讀值，它比 list 更有效率
-# 當超過 maxlen 時，最舊的資料會自動被移除
-adc_readings = deque((), ADC_SAMPLES)
+# 建立一個列表來存放最近的 N 筆讀值
+# 初始值全部填 0
+readings = [0] * NUM_READINGS
 
-print("實驗 #5-1 開始，請旋轉可變電阻...")
+# 用來指向目前要更新的列表位置
+reading_index = 0
 
-# ----------------------------------------------------
-# 主迴圈
-# ----------------------------------------------------
-try:
-    while True:
-        # 1. 讀取 ADC 的原始值 (0-4095)
-        current_reading = adc.read()
-        
-        # 2. 將新讀值加入 deque 中進行平滑處理
-        adc_readings.append(current_reading)
-        
-        # 3. 計算移動平均值
-        smoothed_adc_value = sum(adc_readings) / len(adc_readings)
-        
-        # 4. 將平滑後的 ADC 值 (0-4095) 映射到 PWM 的 duty cycle (0-65535)
-        # 這是線性的轉換：(輸入值 / 輸入範圍) * 輸出範圍
-        duty_cycle = int((smoothed_adc_value / ADC_MAX_VALUE) * PWM_MAX_DUTY)
-        
-        # 5. 設定 LED 的亮度
-        # 使用 duty_u16() 可以提供更精細的 16-bit 亮度控制
-        green_pwm.duty_u16(duty_cycle)
-        
-        # 6. (可選) 在終端機印出資訊，方便除錯與觀察
-        print(f"原始 ADC: {current_reading:4d}, 平滑後 ADC: {int(smoothed_adc_value):4d}, PWM Duty: {duty_cycle:5d}")
-        
-        # 7. 短暫延遲，避免迴圈過快，降低 CPU 負載
-        time.sleep_ms(50) # 每秒讀取 20 次
+# 用來存放目前列表內所有讀值的總和
+total = 0
 
-except KeyboardInterrupt:
-    # 當按下 Ctrl+C 時，優雅地關閉程式
-    print("程式已停止。")
-    # 關閉 PWM，確保 LED 熄滅
-    green_pwm.deinit()
+print("程式啟動，請旋轉可變電阻來調整綠色LED亮度。")
+print("紅色與黃色LED將維持熄滅狀態。")
+
+# --- 主迴圈 ---
+while True:
+    # 1. 從 readings 列表中減去最舊的一筆資料
+    total = total - readings[reading_index]
+    
+    # 2. 從 ADC 讀取新的值
+    # read_u16() 會回傳一個 16-bit 的值 (0-65535)，正好對應 PWM 的 duty_u16()
+    # 這比 read() (回傳 0-4095) 更方便，省去了手動轉換的步驟
+    new_reading = adc.read_u16()
+    
+    # 3. 將新的讀值存入列表的當前位置
+    readings[reading_index] = new_reading
+    
+    # 4. 將新的讀值加到總和中
+    total = total + new_reading
+    
+    # 5. 移動索引到下一個位置，準備下次覆寫
+    # 使用取餘數 (%) 運算子實現環狀佇列的效果
+    reading_index = (reading_index + 1) % NUM_READINGS
+    
+    # 6. 計算移動平均值
+    # 使用整數除法 (//) 即可
+    average_adc = total // NUM_READINGS
+    
+    # 7. 將平滑處理後的平均值設定為 PWM 的 duty cycle
+    # 因為我們使用了 read_u16()，其範圍 (0-65535) 完美對應 duty_u16()
+    # 當可變電阻轉到底 (0V)，average_adc 接近 0，LED 熄滅
+    # 當可變電阻轉到頂 (3.3V)，average_adc 接近 65535，LED 最亮
+    pwm_green.duty_u16(average_adc)
+
+    # 8. (可選) 在 REPL 印出目前讀值，方便除錯和觀察
+    # 使用字串串接來避免 f-string
+    print("原始ADC讀值: ", str(new_reading), " , 平滑後平均值 (Duty): ", str(average_adc))
+    
+    # 9. 短暫延遲，決定更新頻率
+    # 50ms 的延遲讓系統有足夠的反應時間，同時不會過度佔用 CPU
+    time.sleep_ms(50)
