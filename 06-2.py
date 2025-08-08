@@ -1,4 +1,4 @@
-# 實驗 #6-2：按鈕短按切換 LED 模式、長按關閉所有 LED (修正版)
+# 實驗 #6-2：按鈕短按切換 LED 模式、長按關閉所有 LED
 # 執行環境：MicroPython v1.24.0 on ESP32-DevKitC
 
 import machine

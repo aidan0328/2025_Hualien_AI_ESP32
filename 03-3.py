@@ -1,4 +1,4 @@
-# 實驗 #3-3：多段動態燈效模式切換器（修正呼吸燈閃爍問題）
+# 實驗 #3-3：多段動態燈效模式切換器
 # 執行環境：MicroPython v1.24.0 on ESP32-DevKitC
 
 import machine
@@ -65,7 +65,6 @@ def check_button_press():
     last_button_state = button_state
     return mode_was_switched
 
-# 【核心修正】修正模式1的閃爍問題
 def mode_1_single_breath():
     """模式 1: 單顆 LED 呼吸燈，並輪流切換。"""
     global breathing_led_index, last_switch_time
@@ -74,7 +73,6 @@ def mode_1_single_breath():
     brightness = (math.sin(time.ticks_ms() * 0.002 * math.pi) + 1) / 2
     duty_cycle = int(brightness * 1023)
     
-    # **關鍵修正**: 不再呼叫 all_leds_off()，只更新當前目標 LED 的亮度
     leds[breathing_led_index].duty(duty_cycle)
 
     # 檢查是否完成一個呼吸週期 (亮度接近最低點)

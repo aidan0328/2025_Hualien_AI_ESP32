@@ -129,9 +129,6 @@ while True:
         # 將溫濕度顯示在第二行
         temp_humi_str = f"T:{temperature:2d}{chr(223)}C  H:{humidity:2d}%"
         
-        # === 這裡是修正的部分 ===
-        # 舊的寫法 (錯誤的): lcd.putstr(temp_humi_str.ljust(16))
-        # 新的寫法 (正確的): 使用 format() 方法來做左對齊並填充空格
         lcd.move_to(0, 1)
         lcd.putstr("{:<16}".format(temp_humi_str))
 

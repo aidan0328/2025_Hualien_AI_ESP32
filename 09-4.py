@@ -7,7 +7,7 @@
 # 3. 根據距離改變蜂鳴器的鳴叫頻率，模擬倒車雷達。
 # 4. 程式主迴圈為非阻塞式，使用 time.ticks_ms() 進行時序控制。
 
-import machine  # <--- 修正：匯入完整的 machine 模組
+import machine
 from machine import Pin, PWM
 import time
 

@@ -63,7 +63,6 @@ class MovingAverage:
     """
     def __init__(self, window_size):
         # 使用 deque 是一個高效的選擇，因為從左邊移除元素 (popleft) 的時間複雜度是 O(1)
-        # 修正：將關鍵字參數 maxlen=... 改為位置參數
         self.data = deque((), window_size)
         self.window_size = window_size
 
