@@ -1,83 +1,98 @@
-# 實驗 #3-1：按鈕切換三段式燈號狀態（綠 → 閃黃 → 紅 循環）
-# 執行環境：MicroPython v1.24.0 on ESP32-DevKitC
+# 實驗 #3-1：按鈕切換三段式燈號狀態
+# MicroPython v1.24.0 on ESP32-DevKitC
 
-from machine import Pin
+import machine
 import time
 
-# --- 硬體腳位設定 ---
-# LED 模組
+# --- 硬體腳位定義 ---
+# 使用常數來定義腳位，方便管理與修改
 RED_LED_PIN = 18
 YELLOW_LED_PIN = 19
 GREEN_LED_PIN = 21
-
-# 按鈕
 BUTTON_PIN = 23
 
-# --- 初始化硬體元件 ---
-# 設定 LED 腳位為輸出模式
-red_led = Pin(RED_LED_PIN, Pin.OUT)
-yellow_led = Pin(YELLOW_LED_PIN, Pin.OUT)
-green_led = Pin(GREEN_LED_PIN, Pin.OUT)
+# --- 初始化 Pin 物件 ---
+# LED 設定為輸出模式
+red_led = machine.Pin(RED_LED_PIN, machine.Pin.OUT)
+yellow_led = machine.Pin(YELLOW_LED_PIN, machine.Pin.OUT)
+green_led = machine.Pin(GREEN_LED_PIN, machine.Pin.OUT)
 
-# 設定按鈕腳位為輸入模式，並啟用內建的下拉電阻
-# 當按鈕按下時，GPIO23 會讀到高電位(1)；未按下時，因下拉電阻而為低電位(0)
-button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_DOWN)
+# 按鈕設定為輸入模式，並使用內部下拉電阻
+# 確保在按鈕未按下時，腳位維持在穩定的低電位
+button = machine.Pin(BUTTON_PIN, machine.Pin.IN, machine.Pin.PULL_DOWN)
 
-# --- 狀態變數初始化 ---
-# 0: 綠燈恆亮
-# 1: 黃燈閃爍
-# 2: 紅燈恆亮
-state = 0
 
-# 用於黃燈閃爍的計時器，實現非阻塞式延遲
+# --- 狀態定義 ---
+# 使用常數來表示不同的燈號狀態，讓程式碼更容易閱讀
+STATE_GREEN = 0
+STATE_YELLOW_FLASH = 1
+STATE_RED = 2
+
+# --- 變數初始化 ---
+# current_state 用來追蹤目前的燈號狀態，從綠燈開始
+current_state = STATE_GREEN
+
+# last_toggle_time 用於實現非阻塞的黃燈閃爍
 last_toggle_time = 0
-flash_interval = 500  # 閃爍間隔（毫秒），500ms亮/500ms滅，即每秒閃爍一次
 
-# --- 程式初始設定 ---
-# 確保一開始只有綠燈亮
-print("程式啟動，初始狀態：綠燈恆亮")
+# --- 初始狀態設定 ---
+# 程式啟動時，先進入力燈恆亮的狀態
 green_led.on()
 yellow_led.off()
 red_led.off()
-
+print("程式啟動，目前模式：綠燈恆亮")
 
 # --- 主迴圈 ---
 while True:
-    # 1. 偵測按鈕事件 (包含防抖動處理)
+    # 偵測按鈕是否被按下 (從低電位變為高電位)
     if button.value() == 1:
-        # 防抖動 (Debounce): 等待一小段時間，確認是否為穩定按下
+        # 按鈕去抖動：短暫延遲以忽略機械彈跳造成的雜訊
         time.sleep_ms(50)
+        
+        # 再次確認按鈕是否真的被按下
         if button.value() == 1:
-            # 確認按下後，更新狀態
-            state = (state + 1) % 3  # 使用取餘數運算實現 0 -> 1 -> 2 -> 0 的循環
-            print(f"按鈕觸發！切換至狀態 {state}")
-            
-            # 等待按鈕釋放，避免在一次長按中觸發多次狀態切換
-            while button.value() == 1:
-                time.sleep_ms(10)
+            # 切換到下一個狀態
+            # 使用取餘數 (%) 運算子來實現 0 -> 1 -> 2 -> 0 的循環
+            current_state = (current_state + 1) % 3
 
-    # 2. 根據當前狀態控制 LED 燈號
-    if state == 0:
-        # 狀態 0: 綠燈恆亮
-        green_led.on()
-        yellow_led.off()
-        red_led.off()
+            # 根據新的狀態，更新 LED 燈號並印出訊息
+            if current_state == STATE_GREEN:
+                green_led.on()
+                yellow_led.off()
+                red_led.off()
+                print("模式切換：綠燈恆亮")
+
+            elif current_state == STATE_YELLOW_FLASH:
+                green_led.off()
+                red_led.off()
+                # 閃爍的邏輯在迴圈下方處理，這裡只需確保其他燈是關閉的
+                print("模式切換：黃燈閃爍")
+
+            elif current_state == STATE_RED:
+                green_led.off()
+                yellow_led.off()
+                red_led.on()
+                print("模式切換：紅燈恆亮")
+
+            # 等待按鈕釋放，避免一次長按觸發多次狀態切換
+            while button.value() == 1:
+                time.sleep_ms(20)
+
+    # --- 根據當前狀態執行持續性動作 ---
+    # 這個區塊負責處理需要持續更新的狀態，例如閃爍
+    if current_state == STATE_YELLOW_FLASH:
+        # 非阻塞式閃爍邏輯
+        # 取得當前時間（毫秒）
+        now = time.ticks_ms()
         
-    elif state == 1:
-        # 狀態 1: 黃燈閃爍 (非阻塞式)
-        green_led.off()
-        red_led.off()
-        
-        current_time = time.ticks_ms()
-        if time.ticks_diff(current_time, last_toggle_time) > flash_interval:
-            yellow_led.toggle()  # .toggle() 會自動反轉目前腳位的狀態 (ON -> OFF, OFF -> ON)
-            last_toggle_time = current_time # 更新上次切換時間
+        # 檢查距離上次切換黃燈狀態是否已超過 500 毫秒
+        if time.ticks_diff(now, last_toggle_time) >= 500:
+            # 切換黃燈狀態 (亮 -> 暗, 暗 -> 亮)
+            # 因為 machine.Pin 沒有 toggle()，我們手動實現
+            yellow_led.value(not yellow_led.value())
             
-    elif state == 2:
-        # 狀態 2: 紅燈恆亮
-        green_led.off()
-        yellow_led.off()
-        red_led.on()
+            # 更新上次切換的時間
+            last_toggle_time = now
 
     # 在迴圈中加入一個微小的延遲，可以降低 CPU 使用率
     time.sleep_ms(10)
