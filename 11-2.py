@@ -1,4 +1,4 @@
-# 實驗 #11-2 (修正版)：具有溫濕度顯示的非阻塞式電子時鐘
+# 實驗 #11-2：具有溫濕度顯示的非阻塞式電子時鐘
 # 執行環境：MicroPython v1.24.0 on ESP32-DevKitC
 
 from machine import Pin, I2C, RTC
