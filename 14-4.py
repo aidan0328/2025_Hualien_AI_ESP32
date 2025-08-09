@@ -22,8 +22,8 @@ from microdot import Microdot, send_file
 from microdot.websocket import with_websocket
 
 # --- 1. 基本設定 ---
-WIFI_SSID = "TP-Link_5E4C_2.4G"
-WIFI_PASS = "0976023369"
+WIFI_SSID = "910"
+WIFI_PASS = "910910910"
 SERVER_PORT = 80 # 使用 80 port，這樣瀏覽器就不用輸入 port 號
 
 # 硬體設定

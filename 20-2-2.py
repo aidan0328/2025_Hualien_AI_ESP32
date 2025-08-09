@@ -9,17 +9,21 @@
 🎯實驗目標
   用 ESP32 #1(發射端)的按鈕去控制 ESP32 #2 (接收端)的LED。
 '''
+
+# 檔案名稱：receiver.py
+# ESP32 #2 (接收端)
+
 import network
 import espnow
 import machine
-import time
 
-# 0. 硬體設定
-# 內建 LED 通常連接到 GPIO2
+# --- 硬體定義 ---
+# 內建 LED 連接到 GPIO2
 led = machine.Pin(2, machine.Pin.OUT)
-led.off()  # 初始狀態設為關閉
+led.value(0) # 預設關閉 LED
 
-# 1. 初始化 Wi-Fi station 模式 (ESP-NOW 運作的必要條件)
+# --- ESP-NOW 初始化 ---
+# 1. 設定 Wi-Fi 為 STA 模式
 sta = network.WLAN(network.STA_IF)
 sta.active(True)
 
@@ -27,42 +31,54 @@ sta.active(True)
 e = espnow.ESPNow()
 e.active(True)
 
-# --- 新增的程式碼區塊 ---
-# 預期會接收訊息的發射端 MAC 位址
-# 注意：在接收端，我們不需要 add_peer()，但知道發射端的 MAC 有助於除錯
-sender_mac_expected = b'\xF4\x65\x0B\xAD\x99\xA0' # <-- 請填入 ESP32 #1 的實際 MAC 位址
+# --- MAC 位址設定 ---
+# ESP32 #1 (發射端) 的 MAC 位址
+peer_mac_bytes = b'\xF4\x65\x0B\xAD\x99\xA0'
 
+# 輔助函式：將 bytes 格式的 MAC 位址轉為可讀字串
 def format_mac(mac_bytes):
-    """將 bytes 格式的 MAC 位址轉換為 xx:xx:xx:xx:xx:xx 字串格式"""
-    return ':'.join(['{:02x}'.format(b) for b in mac_bytes])
+    mac_str = ""
+    for i, byte in enumerate(mac_bytes):
+        hex_byte = '{:02X}'.format(byte)
+        mac_str += hex_byte
+        if i < len(mac_bytes) - 1:
+            mac_str += ":"
+    return mac_str
 
-# 獲取本機 (接收端) 的 MAC 位址
-my_mac = sta.config('mac')
+# 註冊對方
+try:
+    e.add_peer(peer_mac_bytes)
+    print("已成功註冊對方。")
+except OSError as e:
+    print("註冊對方失敗:", e)
 
-print("==========================================")
-print("ESP-NOW 接收端初始化完成。")
-print("本機 (接收端) MAC 位址: {}".format(format_mac(my_mac)))
-# 為了清楚起見，也顯示我們預期從哪個發射端接收訊息
-print("預期發射端 MAC 位址: {}".format(format_mac(sender_mac_expected)))
-print("==========================================")
-print("等待訊息中...")
-# --- 新增的程式碼區塊結束 ---
+# 顯示自己的 MAC 位址
+my_mac_bytes = sta.config('mac')
+print("--- ESP32 #2 (接收端) 初始化完成 ---")
+print("我的 MAC 位址: " + format_mac(my_mac_bytes))
+print("對方的 MAC 位址: " + format_mac(peer_mac_bytes))
+print("------------------------------------")
+print("初始化完成，等待接收訊息...")
 
-
-# 3. 主迴圈
+# --- 主迴圈 ---
 while True:
-    # 等待接收訊息
-    host_mac, msg = e.recv()
+    # 等待接收訊息 (e.recv() 是阻塞的)
+    host, msg = e.recv()
     
-    # 檢查是否真的收到了訊息 (超時會返回 None)
+    # 如果有收到訊息
     if msg:
-        # 將收到的 bytes MAC 位址格式化後再列印
-        print("收到來自 {} 的訊息，內容：{}".format(format_mac(host_mac), msg))
+        # 將收到的 host (bytes) 和 msg (bytes) 轉為字串顯示
+        print("從 " + format_mac(host) + " 收到訊息: " + str(msg, 'utf-8'))
         
         # 如果收到的訊息是 'toggle'
         if msg == b'toggle':
-            print("收到 'toggle' 指令，正在切換 LED 狀態。")
-            # 執行 LED 狀態切換
-            led.value(not led.value())
-        else:
-            print("收到未知的指令。")
+            # 實現 toggle 功能：讀取目前狀態，然後設定為相反的狀態
+            current_state = led.value()
+            new_state = not current_state
+            led.value(new_state)
+            
+            # 顯示 LED 的新狀態
+            if new_state:
+                print("LED 已開啟。")
+            else:
+                print("LED 已關閉。")

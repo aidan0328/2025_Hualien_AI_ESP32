@@ -3,103 +3,101 @@
 # ----------------------------------------------------------------------
 import network
 import espnow
-import machine
+from machine import Pin
 import time
 import ubinascii
 
-# --- 硬體與常數設定 ---
-LED_PIN = 2
-BUTTON_PIN = 23
-DEBOUNCE_MS = 200 # 按鈕防抖動的毫秒數
+# --- 硬體與網路設定 ---
 
-# ----------------------------------------------------------------------
-# !!! 重要設定：請根據您正在設定的開發板來選擇對應的 MAC 位址 !!!
-# ----------------------------------------------------------------------
+# 硬體腳位定義
+led_pin = Pin(2, Pin.OUT, value=0)  # 內建 LED 在 GPIO2，初始關閉
+# 按鈕在 GPIO23，使用內部上拉電阻，按下時為低電位
+button_pin = Pin(23, Pin.IN, Pin.PULL_UP)
 
-# ▼▼▼ 設定為【ESP32 #1】時使用此區塊 ▼▼▼
-MY_BOARD_NAME = "ESP32 #1"
-MY_MAC_STR = "F4:65:0B:AD:99:A0"
-PEER_MAC_STR = "5C:01:3B:E3:7B:08"
-# ▲▲▲ 設定為【ESP32 #1】時使用此區塊 ▲▲▲
+# MAC 地址定義
+mac_esp1_str = "F4:65:0B:AD:99:A0"
+mac_esp2_str = "D8:13:2A:7A:72:98"
 
-# ▼▼▼ 設定為【ESP32 #2】時，請註解上面區塊，並取消註解此區塊 ▼▼▼
-# MY_BOARD_NAME = "ESP32 #2"
-# MY_MAC_STR = "5C:01:3B:E3:7B:08"
-# PEER_MAC_STR = "F4:65:0B:AD:99:A0"
-# ▲▲▲ 設定為【ESP32 #2】時使用此區塊 ▲▲▲
+# 將字串格式的 MAC 地址轉換為 ESP-NOW 需要的位元組格式
+# 對方 (Peer) 的 MAC 地址
+peer_mac_bytes = ubinascii.unhexlify(mac_esp2_str.replace(':', ''))
 
-# ----------------------------------------------------------------------
 
-# 全域變數
-last_press_time = 0
-led = machine.Pin(LED_PIN, machine.Pin.OUT)
+# --- 初始化 ESP-NOW ---
 
-# 輔助函式：切換 LED 狀態
-def toggle_led(p):
-    p.value(not p.value())
+print("實驗 #20-3-1: ESP32 #1 啟動中...")
 
-# 中斷服務常式 (ISR)，當按鈕被按下時觸發
-def button_isr(pin):
-    global last_press_time
-    now = time.ticks_ms()
-    # 簡易的防抖動處理
-    if time.ticks_diff(now, last_press_time) > DEBOUNCE_MS:
-        last_press_time = now
-        print("按鈕被按下，傳送 'toggle' 訊息...")
-        try:
-            e.send(PEER_MAC_BIN, b'toggle')
-        except OSError as err:
-            print("傳送失敗: {}".format(err))
-
-# --- 主程式開始 ---
-
-# 1. 初始化WLAN Station介面 (ESP-NOW的必要條件)
+# 1. 初始化 Wi-Fi STA 模式
+# ESP-NOW 需要 Wi-Fi 處於活動狀態，但不需要連接到任何 AP
 sta = network.WLAN(network.STA_IF)
 sta.active(True)
-# ESP8266需要disconnect，ESP32通常不需要，但保留也無害
-if hasattr(sta, 'disconnect'):
-    sta.disconnect()
 
-# 2. 初始化ESP-NOW
+# 2. 初始化 ESP-NOW
 e = espnow.ESPNow()
 e.active(True)
 
-# 3. 處理MAC位址
-# 將字串格式的MAC位址轉換為ESP-NOW需要的二進位格式
-MY_MAC_BIN = ubinascii.unhexlify(MY_MAC_STR.replace(':', ''))
-PEER_MAC_BIN = ubinascii.unhexlify(PEER_MAC_STR.replace(':', ''))
-
-# 4. 新增對方位址到 ESP-NOW 列表中
+# 3. 新增對方為 Peer
 try:
-    e.add_peer(PEER_MAC_BIN)
+    e.add_peer(peer_mac_bytes)
+    print("成功新增 Peer: ", mac_esp2_str)
 except OSError as e:
-    # 如果對方已經存在，可能會引發 OSError，這裡我們忽略它
-    if "ESP_ERR_ESPNOW_EXIST" not in str(e):
-        raise
+    print("新增 Peer 失敗: ", e)
 
-# 5. 顯示初始化資訊
-print("--- ESP-NOW 雙向控制器 ---")
-print("初始化完成: {}".format(MY_BOARD_NAME))
-print("本機 MAC 位址: {}".format(MY_MAC_STR))
-print("對方位址: {}".format(PEER_MAC_STR))
 
-# 6. 設定硬體 (LED 和 按鈕)
-led.off() # 確保啟動時LED是熄滅的
-button = machine.Pin(BUTTON_PIN, machine.Pin.IN, machine.Pin.PULL_DOWN)
+# 4. 顯示本機與對方的 MAC 地址 (符合要求 0-4)
+my_mac_bytes = sta.config('mac')
+my_mac_str = ubinascii.hexlify(my_mac_bytes, ':').decode().upper()
 
-# 7. 設定按鈕中斷
-button.irq(trigger=machine.Pin.IRQ_RISING, handler=button_isr)
+print("--- 初始化完成 ---")
+print("本機 (ESP32 #1) MAC 地址: ", my_mac_str)
+print("對方 (ESP32 #2) MAC 地址: ", mac_esp2_str)
+print("--------------------")
 
-# 8. 進入主迴圈，等待接收訊息
-print("\n系統準備就緒，等待按鈕觸發或接收訊息...")
+
+# --- 中斷處理函式與主迴圈 ---
+
+# 建立一個旗標來表示按鈕是否被按下，避免在 ISR 中執行複雜操作
+button_pressed_flag = False
+last_press_time = 0 # 用於按鈕防抖動
+
+def button_irq_handler(pin):
+    """按鈕中斷服務常式 (ISR)"""
+    global button_pressed_flag, last_press_time
+    # 簡單的防抖動處理 (debounce)
+    current_time = time.ticks_ms()
+    if time.ticks_diff(current_time, last_press_time) > 200: # 200毫秒的防抖間隔
+        button_pressed_flag = True
+        last_press_time = current_time
+
+# 設定中斷，當按鈕被按下 (電位從高變低) 時觸發
+button_pin.irq(trigger=Pin.IRQ_FALLING, handler=button_irq_handler)
+
+print("系統準備就緒，可以開始互相控制...")
+
+# 主迴圈
 while True:
-    host, msg = e.recv()
-    if msg:
-        # 將接收到的MAC位址轉為可讀格式
-        host_str = ubinascii.hexlify(host, ':').decode()
-        print("從 {} 收到訊息: {}".format(host_str, msg))
+    # 檢查是否需要發送訊息 (由中斷旗標觸發)
+    if button_pressed_flag:
+        print("偵測到按鈕按下，發送訊息給 ESP32 #2...")
+        try:
+            # 發送一個簡單的位元組訊息，內容可以是任何東西
+            e.send(peer_mac_bytes, b'toggle_led')
+        except OSError as err:
+            print("發送訊息失敗: ", err)
+        
+        button_pressed_flag = False # 處理完畢後，重置旗標
 
-        # 如果收到 'toggle' 指令，就切換本機LED
-        if msg == b'toggle':
-            print("指令正確，切換本機 LED 狀態")
-            toggle_led(led)
+    # 檢查是否接收到訊息 (非阻塞模式)
+    host, msg = e.recv(0) # 設置 timeout=0 為非阻塞
+    if msg: # 如果收到了訊息
+        # 將收到的 MAC 位元組轉換為字串以供顯示
+        sender_mac = ubinascii.hexlify(host, ':').decode().upper()
+        print("從 ", sender_mac, " 收到訊息: ", msg.decode())
+        
+        # 切換本機 LED 狀態 (符合要求 0-0，不使用 toggle())
+        current_led_state = led_pin.value()
+        led_pin.value(not current_led_state)
+        print("切換本機 LED 狀態為: ", "開" if not current_led_state else "關")
+
+    # 短暫延遲，降低 CPU 使用率
+    time.sleep_ms(20)

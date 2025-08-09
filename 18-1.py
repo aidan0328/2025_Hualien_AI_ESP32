@@ -18,8 +18,8 @@ from microdot import Microdot, send_file
 from microdot.websocket import with_websocket
 
 # --- WiFi 連線設定 ---
-WIFI_SSID = 'TP-Link_5E4C_2.4G'
-WIFI_PASS = '0976023369'
+WIFI_SSID = '910'
+WIFI_PASS = '910910910'
 WEB_ROOT = '/web'
 
 # --- 硬體設定 ---

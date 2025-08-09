@@ -9,16 +9,20 @@
 🎯實驗目標
   用 ESP32 #1(發射端)的按鈕去控制 ESP32 #2 (接收端)的LED。
 '''
+# 檔案名稱：sender.py
+# ESP32 #1 (發射端)
+
 import network
 import espnow
 import machine
 import time
 
-# 0. 硬體設定
-# 按鈕連接到 GPIO23，使用內部下拉電阻
-button = machine.Pin(23, machine.Pin.IN, machine.Pin.PULL_DOWN)
+# --- 硬體定義 ---
+# 按鈕連接到 GPIO23，使用內部上拉電阻
+button = machine.Pin(23, machine.Pin.IN, machine.Pin.PULL_UP)
 
-# 1. 初始化 Wi-Fi station 模式 (ESP-NOW 運作的必要條件)
+# --- ESP-NOW 初始化 ---
+# 1. 設定 Wi-Fi 為 STA 模式
 sta = network.WLAN(network.STA_IF)
 sta.active(True)
 
@@ -26,47 +30,55 @@ sta.active(True)
 e = espnow.ESPNow()
 e.active(True)
 
-# 3. 新增通訊對象 (Peer)
-# 這是 ESP32 #2 (接收端) 的 MAC 地址
-peer_mac = b'\x5c\x01\x3b\xe3\x7b\x08'
-e.add_peer(peer_mac)
+# --- MAC 位址設定 ---
+# ESP32 #2 (接收端) 的 MAC 位址
+peer_mac_bytes = b'\xD8\x13\x2A\x7A\x72\x98'
 
-
-# 獲取並格式化 MAC 位址以便於閱讀
+# 輔助函式：將 bytes 格式的 MAC 位址轉為可讀字串
 def format_mac(mac_bytes):
-    """將 bytes 格式的 MAC 位址轉換為 xx:xx:xx:xx:xx:xx 字串格式"""
-    return ':'.join(['{:02x}'.format(b) for b in mac_bytes])
+    mac_str = ""
+    for i, byte in enumerate(mac_bytes):
+        hex_byte = '{:02X}'.format(byte)
+        mac_str += hex_byte
+        if i < len(mac_bytes) - 1:
+            mac_str += ":"
+    return mac_str
 
-# 獲取本機 (發射端) 的 MAC 位址
-my_mac = sta.config('mac')
-
-print("==========================================")
-print("ESP-NOW 發射端初始化完成。")
-print("本機 (發射端) MAC 位址: {}".format(format_mac(my_mac)))
-print("接收端 MAC 位址:       {}".format(format_mac(peer_mac)))
-print("==========================================")
-print("請按下按鈕以發送 'toggle' 指令。")
+# 註冊對方
+try:
+    e.add_peer(peer_mac_bytes)
+    print("已成功註冊對方。")
+except OSError as e:
+    print("註冊對方失敗:", e)
 
 
-# 用於按鈕防彈跳 (debouncing) 的變數
-last_button_state = 0
+# 顯示自己的 MAC 位址
+my_mac_bytes = sta.config('mac')
+print("--- ESP32 #1 (發射端) 初始化完成 ---")
+print("我的 MAC 位址: " + format_mac(my_mac_bytes))
+print("對方的 MAC 位址: " + format_mac(peer_mac_bytes))
+print("------------------------------------")
+print("初始化完成，等待按鈕按下...")
 
-# 4. 主迴圈
+# --- 主迴圈 ---
+last_state = 1  # 按鈕的初始狀態 (1 代表未按下)
 while True:
-    current_button_state = button.value()
-
-    # 偵測按鈕是否被按下 (從 0 變為 1 的上升緣)
-    if current_button_state == 1 and last_button_state == 0:
-        message = b'toggle'
-        print("按鈕已按下！ 正在發送訊息：{}".format(message))
+    current_state = button.value()
+    
+    # 偵測下降緣 (從未按 -> 按下)
+    if last_state == 1 and current_state == 0:
+        print("按鈕已按下，發送 'toggle' 訊息...")
         
         # 發送訊息給指定的 peer
         try:
-            e.send(peer_mac, message)
+            e.send(peer_mac_bytes, b'toggle')
         except OSError as err:
-            print("發送訊息時發生錯誤：{}".format(err))
+            print("發送失敗:", err)
 
-    last_button_state = current_button_state
+        # 簡單的防彈跳延遲
+        time.sleep_ms(50)
+        
+    last_state = current_state
     
-    # 短暫延遲 20 毫秒以降低 CPU 使用率並做為簡易的防彈跳
-    time.sleep_ms(20)
+    # 短暫休眠，降低 CPU 使用率
+    time.sleep_ms(10)

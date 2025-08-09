@@ -26,8 +26,8 @@ led_state = 0  # 初始狀態為 0 (關)
 led.value(led_state)
 
 # --- WIFI 設定 ---
-WIFI_SSID = "TP-Link_5E4C_2.4G"
-WIFI_PASS = "0976023369"
+WIFI_SSID = "910"
+WIFI_PASS = "910910910"
 
 # --- WiFi 連線函式 ---
 def do_connect():

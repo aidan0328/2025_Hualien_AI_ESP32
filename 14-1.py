@@ -14,8 +14,8 @@ import machine
 from microdot import Microdot, redirect
 
 # --- WiFi 連線設定 ---
-WIFI_SSID = 'TP-Link_5E4C_2.4G'
-WIFI_PASSWORD = '0976023369'
+WIFI_SSID = '910'
+WIFI_PASSWORD = '910910910'
 
 # --- 硬體設定 ---
 # 大部分的 ESP32 DevKitC 開發板內建 LED 連接到 GPIO 2

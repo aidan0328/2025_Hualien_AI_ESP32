@@ -11,7 +11,7 @@ import LCD1602 # 匯入您提供的 LCD 驅動程式
 # --- 使用者設定 ---
 # 請在此處填寫您的 Wi-Fi 資訊
 WIFI_SSID = "Hi-NET" 
-WIFI_PASSWORD = "09760233690"
+WIFI_PASSWORD = "9109109100"
 
 # --- 硬體與常數設定 ---
 I2C_SCL_PIN = 17

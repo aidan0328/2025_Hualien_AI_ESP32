@@ -10,157 +10,147 @@
 '''
 
 import machine
-import time
-import asyncio
 import network
+import time
+import os
 import json
+import asyncio
 from microdot import Microdot, send_file
 from microdot.websocket import with_websocket
 
-# --- WiFi 設定 ---
-WIFI_SSID = 'TP-Link_5E4C_2.4G'
-WIFI_PASSWORD = '0976023369'
-# -----------------
+# --- 0. 基本設定 ---
+# 0-0. 手動實現 toggle 功能
+def toggle_pin(p):
+    p.value(not p.value())
 
-# --- 硬體設定 ---
-# 使用 PWM 來控制 LED 亮度
-# 頻率 1000Hz 可以避免閃爍
-led_pwm = machine.PWM(machine.Pin(2), freq=1000)
-# -----------------
+# 0-1. WIFI 名稱與密碼
+WIFI_SSID = '910'
+WIFI_PASS = '910910910'
 
-# --- 全域變數與狀態管理 ---
-clients = set()  # 存放所有連接的 websocket 客戶端
-# 使用字典來統一管理 LED 狀態
+# 硬體設定
+LED_PIN = 2
+led_pin = machine.Pin(LED_PIN, machine.Pin.OUT)
+# 使用 PWM 控制 LED 亮度，頻率設定為 1000 Hz
+led_pwm = machine.PWM(led_pin, freq=1000, duty_u16=0)
+
+# --- 全域變數，用於管理狀態與連線 ---
+websockets = set()
+# 初始狀態：滅
 led_state = {
-    "state": "off",      # 'on' 或 'off'
-    "brightness": 100    # 亮度百分比 (5-100)
+    "is_on": False,
+    "brightness": 0  # 使用 0-100 的百分比來表示亮度
 }
-# 用於確保同時只有一個任務在修改 LED 狀態
-state_lock = asyncio.Lock()
 
-# --- WiFi 連線函數 ---
-async def connect_wifi():
-    """非同步連線到 WiFi"""
-    sta_if = network.WLAN(network.STA_IF)
-    sta_if.active(True)
-    if not sta_if.isconnected():
-        print("正在連線到 WiFi...")
-        sta_if.connect(WIFI_SSID, WIFI_PASSWORD)
-        while not sta_if.isconnected():
-            print(".", end="")
-            await asyncio.sleep(0.5)
-    print("\nWiFi 已連線!")
-    #print("網路設定:", sta_if.ifconfig())
-    print(f'ESP32 IP Address: http://{sta_if.ifconfig()[0]}')
-# --- LED 控制與廣播函數 ---
-async def update_led_and_broadcast():
-    """根據全域 led_state 更新 LED 硬體狀態並廣播給所有客戶端"""
-    async with state_lock:
-        state_str = json.dumps(led_state)
-        print("更新並廣播狀態: ", state_str)
+# --- 1. WiFi 連線 ---
+def connect_wifi():
+    """連線到指定的 WiFi 網路"""
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print('正在連接網路...')
+        wlan.connect(WIFI_SSID, WIFI_PASS)
+        while not wlan.isconnected():
+            time.sleep_ms(500)
+    
+    ip_address = wlan.ifconfig()[0]
+    print('伺服器的網址是 http://{}:80'.format(ip_address))
+    return ip_address
 
-        if led_state["state"] == "on":
-            # 將 5-100 的百分比對應到 0-1023 的 duty cycle
-            # 5% -> 51, 100% -> 1023
-            duty = int((led_state["brightness"] / 100) * 1023)
-            # 確保 duty cycle 不會低於最小值
-            if duty < 51: duty = 51 
-            led_pwm.duty(duty)
-        else:
-            led_pwm.duty(0) # 關閉 LED
-        
-        # 廣播給所有客戶端
-        for ws in list(clients):
-            try:
-                await ws.send(state_str)
-            except Exception as e:
-                print("傳送失敗，移除客戶端: ", e)
-                clients.remove(ws)
-
-# --- Microdot 網頁伺服器設定 ---
+# --- 2. Microdot 伺服器設定 ---
 app = Microdot()
 
-# --- WebSocket 路由 ---
+async def broadcast_state():
+    """廣播 LED 的目前狀態給所有 websocket 客戶端"""
+    state_msg = json.dumps(led_state)
+    
+    for ws in list(websockets):
+        try:
+            await ws.send(state_msg)
+        except Exception:
+            websockets.remove(ws)
+            print("一個 WebSocket 客戶端已移除")
+
+def update_led():
+    """根據 led_state 更新 PWM 輸出"""
+    if led_state["is_on"]:
+        # 將 5%-100% 的亮度對應到 duty_u16 的範圍 (0-65535)
+        # 5% -> 3277, 100% -> 65535
+        duty = int(led_state["brightness"] / 100 * 65535)
+        led_pwm.duty_u16(duty)
+    else:
+        led_pwm.duty_u16(0)
+    print("更新 LED 狀態: is_on={}, brightness={}%, duty_u16={}".format(
+        led_state["is_on"], led_state["brightness"], led_pwm.duty_u16()
+    ))
+
+# --- 4. 路由設定 ---
+# 0-8. 將 WebSocket 路由放在最前面
 @app.route('/ws')
 @with_websocket
-async def ws_handler(request, ws):
+async def websocket_handler(request, ws):
     """處理 WebSocket 連線與訊息"""
-    print("WebSocket 客戶端已連線")
-    clients.add(ws)
+    print("一個 WebSocket 客戶端已連線")
+    websockets.add(ws)
+    
+    # 新客戶端連線時，立即發送目前的 LED 狀態
+    await ws.send(json.dumps(led_state))
+    
     try:
-        # 連線後立即傳送目前狀態
-        await ws.send(json.dumps(led_state))
-        
-        # 持續接收客戶端訊息
         while True:
-            data = await ws.receive()
+            data_str = await ws.receive()
             try:
-                command = json.loads(data)
-                action = command.get('action')
-                print("收到指令: ", command)
-                
-                async with state_lock:
-                    state_changed = False
-                    if action == 'on' and led_state['state'] == 'off':
-                        led_state['state'] = 'on'
-                        state_changed = True
-                    elif action == 'off' and led_state['state'] == 'on':
-                        led_state['state'] = 'off'
-                        state_changed = True
-                    elif action == 'toggle':
-                        led_state['state'] = 'off' if led_state['state'] == 'on' else 'on'
-                        state_changed = True
-                    elif action == 'set_brightness':
-                        value = command.get('value')
-                        if isinstance(value, int) and 5 <= value <= 100:
-                            if led_state['brightness'] != value:
-                                led_state['brightness'] = value
-                                state_changed = True
-                
-                if state_changed:
-                    await update_led_and_broadcast()
+                data = json.loads(data_str)
+                action = data.get('action')
+
+                if action == 'on':
+                    led_state["is_on"] = True
+                    if led_state["brightness"] < 5: # 如果亮度為0，預設為100%
+                        led_state["brightness"] = 100
+                elif action == 'off':
+                    led_state["is_on"] = False
+                elif action == 'toggle':
+                    led_state["is_on"] = not led_state["is_on"]
+                    if led_state["is_on"] and led_state["brightness"] < 5:
+                        led_state["brightness"] = 100
+                elif action == 'brightness':
+                    # 確保亮度在 5 到 100 之間
+                    brightness = int(data.get('value', 100))
+                    led_state["brightness"] = max(5, min(100, brightness))
+
+                update_led()
+                await broadcast_state()
 
             except (ValueError, KeyError) as e:
-                print("無效的 WebSocket 訊息: ", data, e)
+                print("收到了無效的 WebSocket 訊息: {}, 錯誤: {}".format(data_str, e))
 
     except Exception as e:
-        print("WebSocket 連線關閉: ", e)
+        print("WebSocket 連線異常關閉: {}".format(e))
     finally:
-        if ws in clients:
-            clients.remove(ws)
-            print("WebSocket 客戶端已移除")
+        websockets.remove(ws)
+        print("一個 WebSocket 客戶端已離線")
 
-# --- 網頁檔案伺服器路由 ---
 @app.route('/')
 async def index(request):
-    """提供主網頁"""
+    """處理根目錄請求，發送網頁"""
     return send_file('/web/15-1.html')
 
 @app.route('/<path:path>')
-async def static(request, path):
-    """提供 /web 資料夾中的靜態檔案"""
+async def static_files(request, path):
+    """處理靜態檔案請求"""
+    full_path = '/web/' + path
     try:
-        return send_file('/web/' + path)
-    except Exception:
-        return 'Not found', 404
+        return send_file(full_path)
+    except OSError:
+        return 'Not Found', 404
 
-# --- 主程式 ---
-async def main():
-    await connect_wifi()
-    
-    print('啟動 Microdot 伺服器...')
-    
-    # 伺服器啟動前，先根據初始狀態設定一次LED
-    await update_led_and_broadcast()
-    
+# --- 5. 主程式執行 ---
+if __name__ == '__main__':
     try:
-        await app.start_server(port=80, debug=True)
-    except Exception as e:
-        print("伺服器啟動失敗: ", e)
-
-# --- 程式進入點 ---
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
+        connect_wifi()
+        update_led() # 確保啟動時LED是滅的
+        print("Microdot 伺服器已啟動")
+        # 使用 asyncio.run 來啟動 Microdot，這是 v2.x 的推薦方式
+        asyncio.run(app.start_server(port=80, debug=True))
     except KeyboardInterrupt:
-        print("程式被手動中斷") 
+        print("伺服器已手動停止")
+        machine.reset()
